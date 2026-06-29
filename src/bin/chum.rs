@@ -52,13 +52,16 @@ mod theme {
     use clap::builder::styling::Styles;
     use console::Style as ConsoleStyle;
 
-    // clap help styling (mirrors the workspace's other binaries).
-    const HEADER: Style = AnsiColor::Green.on_default().effects(Effects::BOLD);
-    const USAGE: Style = AnsiColor::Green.on_default().effects(Effects::BOLD);
-    const LITERAL: Style = AnsiColor::Cyan.on_default().effects(Effects::BOLD);
-    const PLACEHOLDER: Style = AnsiColor::Cyan.on_default();
+    // clap help styling. The stock cargo palette (green headers, cyan literals)
+    // is retinted to chum's own: magenta for structure (headers/usage) and blue
+    // for the literals you type (subcommands, flags, valid values). Green is
+    // reserved for success at runtime.
+    const HEADER: Style = AnsiColor::Magenta.on_default().effects(Effects::BOLD);
+    const USAGE: Style = AnsiColor::Magenta.on_default().effects(Effects::BOLD);
+    const LITERAL: Style = AnsiColor::Blue.on_default().effects(Effects::BOLD);
+    const PLACEHOLDER: Style = AnsiColor::Blue.on_default();
     const ERROR: Style = AnsiColor::Red.on_default().effects(Effects::BOLD);
-    const VALID: Style = AnsiColor::Cyan.on_default().effects(Effects::BOLD);
+    const VALID: Style = AnsiColor::Blue.on_default().effects(Effects::BOLD);
     const INVALID: Style = AnsiColor::Yellow.on_default().effects(Effects::BOLD);
 
     pub(super) const CLAP_STYLES: Styles = Styles::styled()
@@ -71,16 +74,19 @@ mod theme {
         .invalid(INVALID);
 
     // Runtime styling. The semantic colors line up with the clap palette
-    // above: green = good/applied, cyan = identifiers, yellow = needs
-    // attention/pending, red = error/dirty.
+    // above: magenta = structure/headings, blue = identifiers, green =
+    // good/applied, yellow = needs attention/pending, red = error/dirty. Using
+    // the 16 named ANSI colors (rather than fixed RGB) lets each terminal's own
+    // theme tune them, so the palette stays legible on dark and light
+    // backgrounds alike.
 
     /// A table header cell, or a success heading.
     pub(super) fn heading() -> ConsoleStyle {
-        ConsoleStyle::new().green().bold()
+        ConsoleStyle::new().magenta().bold()
     }
     /// A migration version number.
     pub(super) fn version() -> ConsoleStyle {
-        ConsoleStyle::new().cyan()
+        ConsoleStyle::new().blue()
     }
     /// An applied migration / success.
     pub(super) fn applied() -> ConsoleStyle {
@@ -110,7 +116,7 @@ fn check() -> console::StyledObject<&'static str> {
 fn spinner(message: &str) -> ProgressBar {
     let pb = ProgressBar::new_spinner();
     pb.set_style(
-        ProgressStyle::with_template("{spinner:.cyan} {msg}")
+        ProgressStyle::with_template("{spinner:.magenta} {msg}")
             .expect("static spinner template is valid")
             .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✓"]),
     );
