@@ -167,7 +167,7 @@ that only needs the library can switch off the CLI dependencies (clap, url,
 tokio, …) with `default-features = false`:
 
 ```toml
-chum = { version = "0.0.1", default-features = false }
+chum = { version = "0.1.0", default-features = false }
 ```
 
 Embed migrations at compile time and drive the `Migrator`:
