@@ -13,8 +13,6 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use anyhow::Context as _;
-use anyhow::bail;
 use chrono::SecondsFormat;
 use chum::Migrator;
 use chum::Progress;
@@ -25,6 +23,10 @@ use clap::Subcommand;
 use clap::ValueEnum;
 use indicatif::ProgressBar;
 use indicatif::ProgressStyle;
+use miette::Context as _;
+use miette::IntoDiagnostic as _;
+use miette::bail;
+use miette::miette;
 use percent_encoding::percent_decode_str;
 use serde::Serialize;
 use tabled::builder::Builder as TableBuilder;
@@ -33,9 +35,10 @@ use url::Url;
 
 /// Visual theme — the single source of truth for color across the CLI.
 ///
-/// Three independent ANSI systems run side by side: `anstyle` (clap's help),
-/// `console` (our runtime output and tables), and `indicatif` (spinners). Each
-/// decides *independently* whether to emit color at all (tty / `NO_COLOR` /
+/// Four independent ANSI systems run side by side: `anstyle` (clap's help),
+/// `console` (our runtime output and tables), `indicatif` (spinners), and
+/// `miette` (error reports; see `install_error_renderer`). Each decides
+/// *independently* whether to emit color at all (tty / `NO_COLOR` /
 /// `CLICOLOR`). To stay uniform we (a) keep one palette here, mapped to both
 /// `anstyle` and `console`, and (b) route **all** table/cell color through
 /// `console`-styled strings rather than tabled's native coloring, so a single
@@ -242,8 +245,8 @@ fn scheme_of(version: i64) -> Scheme {
 }
 
 /// Print a value as pretty JSON to stdout.
-fn print_json<T: Serialize>(value: &T) -> anyhow::Result<()> {
-    println!("{}", serde_json::to_string_pretty(value)?);
+fn print_json<T: Serialize>(value: &T) -> miette::Result<()> {
+    println!("{}", serde_json::to_string_pretty(value).into_diagnostic()?);
     Ok(())
 }
 
@@ -273,7 +276,7 @@ fn human_time(dt: chrono::DateTime<chrono::Utc>) -> String {
 /// pretty table; in any non-interactive or machine-output mode it refuses
 /// rather than block on stdin, so a piped `revert` fails fast instead of
 /// hanging.
-fn confirm(prompt: &str, assume_yes: bool, fmt: Resolved) -> anyhow::Result<bool> {
+fn confirm(prompt: &str, assume_yes: bool, fmt: Resolved) -> miette::Result<bool> {
     if assume_yes {
         return Ok(true);
     }
@@ -286,7 +289,7 @@ fn confirm(prompt: &str, assume_yes: bool, fmt: Resolved) -> anyhow::Result<bool
     eprint!("{prompt} {} ", theme::muted().apply_to("[y/N]"));
     std::io::stderr().flush().ok();
     let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
+    std::io::stdin().read_line(&mut line).into_diagnostic()?;
     Ok(matches!(
         line.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
@@ -424,17 +427,40 @@ async fn main() -> ExitCode {
 
     let cli = Cli::parse();
     cli.color.apply();
+    install_error_renderer(cli.color);
 
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("{} {e:#}", theme::dirty().apply_to("error:"));
+        Err(report) => {
+            // `Report`'s `Debug` impl renders through the handler installed
+            // above: the error chain, the `chum::*` code, and the `help` line.
+            eprintln!("{report:?}");
             ExitCode::FAILURE
         }
     }
 }
 
-async fn run(cli: Cli) -> anyhow::Result<()> {
+/// Install miette's graphical error renderer, honoring `--color`.
+///
+/// This is the fourth ANSI system in play (after `anstyle`, `console`, and
+/// `indicatif`; see [`theme`]). Unlike the others it colorizes *error* output,
+/// so we wire `--color` straight into its handler: `always`/`never` force the
+/// setting, `auto` leaves miette's own tty/`NO_COLOR` detection in place. The
+/// hook can only be installed once; a failure means one already exists, which
+/// we ignore.
+fn install_error_renderer(color: ColorChoice) {
+    let _ = miette::set_hook(Box::new(move |_| {
+        let opts = miette::MietteHandlerOpts::new();
+        let opts = match color {
+            ColorChoice::Always => opts.color(true),
+            ColorChoice::Never => opts.color(false),
+            ColorChoice::Auto => opts,
+        };
+        Box::new(opts.build())
+    }));
+}
+
+async fn run(cli: Cli) -> miette::Result<()> {
     let fmt = cli.format.resolve(cli.json);
 
     // `add` and `convert` are purely local and need no database connection.
@@ -596,7 +622,7 @@ fn state_str(state: State) -> &'static str {
     }
 }
 
-fn render_info(statuses: &[chum::Status], fmt: Resolved) -> anyhow::Result<()> {
+fn render_info(statuses: &[chum::Status], fmt: Resolved) -> miette::Result<()> {
     match fmt {
         Resolved::Pretty => {
             if statuses.is_empty() {
@@ -688,7 +714,7 @@ fn render_info(statuses: &[chum::Status], fmt: Resolved) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn render_applied(applied: &[chum::Applied], fmt: Resolved) -> anyhow::Result<()> {
+fn render_applied(applied: &[chum::Applied], fmt: Resolved) -> miette::Result<()> {
     match fmt {
         Resolved::Pretty => {
             if applied.is_empty() {
@@ -744,7 +770,7 @@ fn render_applied(applied: &[chum::Applied], fmt: Resolved) -> anyhow::Result<()
     Ok(())
 }
 
-fn render_plan(planned: &[chum::Planned], fmt: Resolved) -> anyhow::Result<()> {
+fn render_plan(planned: &[chum::Planned], fmt: Resolved) -> miette::Result<()> {
     match fmt {
         Resolved::Pretty => {
             if planned.is_empty() {
@@ -789,7 +815,7 @@ fn render_plan(planned: &[chum::Planned], fmt: Resolved) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn render_revert(versions: &[i64], fmt: Resolved, phase: RevertPhase) -> anyhow::Result<()> {
+fn render_revert(versions: &[i64], fmt: Resolved, phase: RevertPhase) -> miette::Result<()> {
     match fmt {
         Resolved::Pretty => {
             if versions.is_empty() {
@@ -839,7 +865,7 @@ fn render_revert(versions: &[i64], fmt: Resolved, phase: RevertPhase) -> anyhow:
     Ok(())
 }
 
-fn render_add(up: &std::path::Path, down: &std::path::Path, fmt: Resolved) -> anyhow::Result<()> {
+fn render_add(up: &std::path::Path, down: &std::path::Path, fmt: Resolved) -> miette::Result<()> {
     let up = up.display().to_string();
     let down = down.display().to_string();
     match fmt {
@@ -866,7 +892,7 @@ fn render_convert(
     to: Scheme,
     dry_run: bool,
     fmt: Resolved,
-) -> anyhow::Result<()> {
+) -> miette::Result<()> {
     let rows: Vec<(String, String)> = plan
         .iter()
         .map(|(from, target)| (basename(from), basename(target)))
@@ -925,7 +951,7 @@ fn render_convert(
     Ok(())
 }
 
-fn render_force(version: i64, fmt: Resolved) -> anyhow::Result<()> {
+fn render_force(version: i64, fmt: Resolved) -> miette::Result<()> {
     match fmt {
         Resolved::Pretty => println!(
             "{} forced {} as applied",
@@ -954,12 +980,14 @@ fn render_force(version: i64, fmt: Resolved) -> anyhow::Result<()> {
 /// - any other query param → a ClickHouse setting.
 ///
 /// `--user` / `--password` / `--database` override the URL.
-fn build_client(cli: &Cli) -> anyhow::Result<clickhouse::Client> {
-    let parsed = Url::parse(&cli.url).with_context(|| format!("invalid --url {:?}", cli.url))?;
+fn build_client(cli: &Cli) -> miette::Result<clickhouse::Client> {
+    let parsed = Url::parse(&cli.url)
+        .into_diagnostic()
+        .with_context(|| format!("invalid --url {:?}", cli.url))?;
 
     let host = parsed
         .host_str()
-        .with_context(|| format!("connection URL {:?} has no host", cli.url))?;
+        .ok_or_else(|| miette!("connection URL {:?} has no host", cli.url))?;
 
     let mut secure = parsed.scheme().to_ascii_lowercase().contains("https");
     let mut user_q = None;
@@ -1067,7 +1095,7 @@ async fn resolve_revert_target(
     table: &str,
     target: Option<i64>,
     steps: Option<usize>,
-) -> anyhow::Result<i64> {
+) -> miette::Result<i64> {
     if let Some(target) = target {
         return Ok(target);
     }
@@ -1108,7 +1136,7 @@ const SEQUENTIAL_WIDTH: usize = 4;
 /// directory gets a fresh [`now_version`]. The `sequential` flag only matters
 /// for a fresh (empty or missing) directory, where it chooses sequential over
 /// the default timestamp.
-fn next_version(dir: &Path, sequential: bool) -> anyhow::Result<String> {
+fn next_version(dir: &Path, sequential: bool) -> miette::Result<String> {
     let max = source::max_version(dir)?;
     Ok(decide_version(max, sequential)?.unwrap_or_else(now_version))
 }
@@ -1125,7 +1153,7 @@ fn next_version(dir: &Path, sequential: bool) -> anyhow::Result<String> {
 /// timestamps, since the two schemes share one numeric ordering space and
 /// grafting a small counter after a timestamp would sort it *before* every
 /// existing migration.
-fn decide_version(max: Option<(i64, usize)>, sequential: bool) -> anyhow::Result<Option<String>> {
+fn decide_version(max: Option<(i64, usize)>, sequential: bool) -> miette::Result<Option<String>> {
     Ok(match max {
         // Fresh directory: the flag picks the scheme (timestamp by default).
         None => sequential.then(|| format!("{:0SEQUENTIAL_WIDTH$}", 1)),
@@ -1152,7 +1180,7 @@ fn decide_version(max: Option<(i64, usize)>, sequential: bool) -> anyhow::Result
 
 /// Renumber every migration in `dir` to the `to` scheme by renaming files.
 /// Filesystem-only — see [`Command::Convert`].
-fn run_convert(dir: &Path, to: Scheme, dry_run: bool, fmt: Resolved) -> anyhow::Result<()> {
+fn run_convert(dir: &Path, to: Scheme, dry_run: bool, fmt: Resolved) -> miette::Result<()> {
     let files = source::migration_files(dir)?;
     if files.is_empty() {
         if fmt == Resolved::Pretty {
@@ -1228,7 +1256,7 @@ fn synthesize_timestamps(n: usize, base: chrono::DateTime<chrono::Utc>) -> Vec<S
 /// would clobber an existing file it does not itself manage. Both are
 /// structurally impossible for the built-in conversions, but the guard keeps a
 /// future mistake from silently destroying a file.
-fn preflight(plan: &[(PathBuf, PathBuf)]) -> anyhow::Result<()> {
+fn preflight(plan: &[(PathBuf, PathBuf)]) -> miette::Result<()> {
     let sources: HashSet<&PathBuf> = plan.iter().map(|(from, _)| from).collect();
     let mut targets: HashSet<&PathBuf> = HashSet::new();
     for (_, target) in plan {
@@ -1247,16 +1275,18 @@ fn preflight(plan: &[(PathBuf, PathBuf)]) -> anyhow::Result<()> {
 /// Apply the rename plan in two phases so an output name colliding with a
 /// not-yet-renamed input cannot clobber it: first move every source aside to a
 /// unique temporary, then move each temporary to its final name.
-fn rename_all(plan: &[(PathBuf, PathBuf)]) -> anyhow::Result<()> {
+fn rename_all(plan: &[(PathBuf, PathBuf)]) -> miette::Result<()> {
     let mut temps: Vec<(PathBuf, &PathBuf)> = Vec::with_capacity(plan.len());
     for (from, target) in plan {
         let tmp = with_suffix(from, ".chum-convert.tmp");
         std::fs::rename(from, &tmp)
+            .into_diagnostic()
             .with_context(|| format!("renaming {} aside", from.display()))?;
         temps.push((tmp, target));
     }
     for (tmp, target) in &temps {
         std::fs::rename(tmp, target)
+            .into_diagnostic()
             .with_context(|| format!("renaming {} -> {}", tmp.display(), target.display()))?;
     }
     Ok(())

@@ -21,9 +21,15 @@ required-features = ["cli"]
 
 [features]
 default = ["cli"]
+# Derive `miette::Diagnostic` on `ChumError`, adding error codes and actionable
+# `help` text. Pulls in `miette` (no `fancy`) — kept optional so the default
+# library build (`--no-default-features`) stays on its advertised 7-dep contract.
+diagnostic = ["dep:miette"]
 # The `chum` binary and its URL→client mapping. The library itself needs none
 # of these; a consumer that only uses the library can disable default features.
-cli = ["dep:anyhow", "dep:clap", "dep:console", "dep:indicatif", "dep:percent-encoding", "dep:serde_json", "dep:tabled", "dep:tokio", "dep:tracing-subscriber", "dep:url"]
+# Enables `diagnostic` so the binary's `?` carries the library's rich error
+# diagnostics, and `miette/fancy` for the graphical terminal renderer.
+cli = ["diagnostic", "miette/fancy", "dep:clap", "dep:console", "dep:indicatif", "dep:percent-encoding", "dep:serde_json", "dep:tabled", "dep:tokio", "dep:tracing-subscriber", "dep:url"]
 
 [dependencies]
 # Library dependencies.
@@ -35,8 +41,11 @@ sha2 = "0.10"
 sqlparser = "0.62"
 thiserror = "2"
 
+# Diagnostics: optional in the library (`diagnostic` feature), always on for the
+# CLI (`cli` adds `miette/fancy` for the graphical terminal renderer).
+miette = { version = "7", default-features = false, features = ["derive"], optional = true }
+
 # CLI-only dependencies (gated behind the `cli` feature).
-anyhow = { version = "1", optional = true }
 clap = { version = "4.5", features = ["derive", "env"], optional = true }
 console = { version = "0.16", optional = true }
 indicatif = { version = "0.18", optional = true }
@@ -48,7 +57,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optio
 url = { version = "2", optional = true }
 
 [dev-dependencies]
-anyhow = "1"
 clickhouse = { version = "0.15", features = ["chrono", "rustls-tls", "uuid"] }
 include_dir = "0.7"
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }

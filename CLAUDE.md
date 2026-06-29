@@ -32,11 +32,16 @@ The crate is split by the `cli` feature (on by default):
   compile with **no default features** (only `chrono`, `clickhouse`,
   `include_dir`, `serde`, `sha2`, `sqlparser`, `thiserror`). `mise run
   build:lib` / `clippy:lib` guard this advertised contract — do not let
-  CLI-only deps leak into the library.
+  CLI-only deps leak into the library. The opt-in `diagnostic` feature adds a
+  `miette::Diagnostic` derive (error codes + `help` text) on `ChumError`,
+  pulling in `miette` (no `fancy`); it is **off** in the no-default-features
+  build, so the contract above is unchanged.
 - **CLI** (`src/bin/chum.rs`, `required-features = ["cli"]`) — owns the
   connection story (URL/DSN → `clickhouse::Client`), presentation, and the
-  interactive prompts. The binary uses `anyhow` for error reporting; the
-  library does not.
+  interactive prompts. The binary uses `miette` for error reporting (the `cli`
+  feature enables `diagnostic` + `miette/fancy`, so the library's per-variant
+  codes and `help` survive `?` and render in the graphical report); the library
+  itself never reports, only returns `ChumError`.
 
 ## CLI flags and env vars travel together
 
@@ -87,9 +92,12 @@ tests/
 
 ### Error handling
 
-- Library: concrete `ChumError` variants via `thiserror`; return
+- Library: concrete `ChumError` variants via `thiserror`, each carrying a
+  `miette` `code` + `help` under the `diagnostic` feature; return
   `chum::Result<T>`.
-- CLI binary: `anyhow` with `.context(...)` for human-facing reporting.
+- CLI binary: `miette` for human-facing reporting — `.into_diagnostic()` to
+  adopt foreign (std/`url`/`serde_json`) errors, then `.with_context(...)`;
+  `ChumError` flows in directly via `?` and keeps its diagnostics.
 
 ## ClickHouse design notes
 
