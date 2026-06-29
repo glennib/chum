@@ -1,0 +1,24 @@
+# Local ClickHouse for the end-to-end test (tests/integration.rs).
+# Start: mise run db:up    (picks podman, falls back to docker)
+# Stop:  mise run db:down
+#
+# Or run a compose runtime directly: `podman compose up -d` / `docker compose up -d`.
+#
+# The e2e test is `#[ignore]`d by default, so this is only needed when running
+# `cargo nextest run --run-ignored all`.
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+volumes:
+  clickhouse-data:

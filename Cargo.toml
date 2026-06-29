@@ -1,0 +1,66 @@
+[package]
+name = "chum"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.94.0"
+repository = "https://github.com/glennib/chum"
+description = "A general-purpose ClickHouse schema migration tool (library + CLI)."
+license = "MIT OR Apache-2.0"
+authors = ["Glenn Bitar <glennbitar@gmail.com>"]
+readme = "README.md"
+keywords = ["clickhouse", "migration", "schema", "database", "cli"]
+categories = ["command-line-utilities", "database"]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "chum"
+path = "src/bin/chum.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+# The `chum` binary and its URL→client mapping. The library itself needs none
+# of these; a consumer that only uses the library can disable default features.
+cli = ["dep:anyhow", "dep:clap", "dep:console", "dep:indicatif", "dep:percent-encoding", "dep:serde_json", "dep:tabled", "dep:tokio", "dep:tracing-subscriber", "dep:url"]
+
+[dependencies]
+# Library dependencies.
+chrono = { version = "0.4", features = ["serde"] }
+clickhouse = { version = "0.15", features = ["chrono", "rustls-tls", "uuid"] }
+include_dir = "0.7"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+sqlparser = "0.62"
+thiserror = "2"
+
+# CLI-only dependencies (gated behind the `cli` feature).
+anyhow = { version = "1", optional = true }
+clap = { version = "4.5", features = ["derive", "env"], optional = true }
+console = { version = "0.16", optional = true }
+indicatif = { version = "0.18", optional = true }
+percent-encoding = { version = "2", optional = true }
+serde_json = { version = "1", optional = true }
+tabled = { version = "0.21", features = ["ansi"], optional = true }
+tokio = { version = "1.49", features = ["macros", "rt-multi-thread"], optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
+url = { version = "2", optional = true }
+
+[dev-dependencies]
+anyhow = "1"
+clickhouse = { version = "0.15", features = ["chrono", "rustls-tls", "uuid"] }
+include_dir = "0.7"
+tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+too-many-lines = "allow"
+doc-markdown = "allow"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+strip = true
+lto = "fat"
+codegen-units = 1

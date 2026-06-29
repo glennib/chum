@@ -1,0 +1,76 @@
+[tools]
+cargo-binstall = "1.20.1"
+"cargo:cargo-dist" = "0.32.0"
+"cargo:cargo-edit" = "0.13.9"
+"cargo:cargo-nextest" = "0.9.132"
+"cargo:release-plz" = "0.3.157"
+
+[tasks.fmt]
+description = "Format code"
+run = "cargo fmt --all"
+
+[tasks."fmt:check"]
+description = "Check code formatting"
+run = "cargo fmt --all -- --check"
+
+[tasks."fmt:nightly"]
+description = "Format code with nightly"
+run = "cargo +nightly fmt --all"
+
+[tasks."fmt:check:nightly"]
+description = "Check code formatting with nightly"
+run = "cargo +nightly fmt --all -- --check"
+
+[tasks.clippy]
+description = "Run clippy lints (all features)"
+run = "cargo clippy --all-targets --all-features -- -D warnings"
+
+[tasks."clippy:lib"]
+description = "Run clippy on the library with no features (consumer contract)"
+run = "cargo clippy --lib --no-default-features -- -D warnings"
+
+[tasks.test]
+description = "Run tests"
+run = "cargo nextest run --all-targets --no-tests=pass"
+
+[tasks.build]
+description = "Build release binary"
+run = "cargo build --release"
+
+[tasks."build:debug"]
+description = "Check that the project compiles"
+run = "cargo build"
+
+[tasks."build:lib"]
+description = "Check the library compiles with no default features"
+run = "cargo build --lib --no-default-features"
+
+[tasks."db:up"]
+description = "Start a local ClickHouse for the e2e test (podman, falling back to docker)"
+run = """
+if command -v podman >/dev/null 2>&1; then
+  podman compose up -d
+elif command -v docker >/dev/null 2>&1; then
+  docker compose up -d
+else
+  echo "error: neither podman nor docker found on PATH" >&2
+  exit 1
+fi
+"""
+
+[tasks."db:down"]
+description = "Stop the local ClickHouse (podman, falling back to docker)"
+run = """
+if command -v podman >/dev/null 2>&1; then
+  podman compose down
+elif command -v docker >/dev/null 2>&1; then
+  docker compose down
+else
+  echo "error: neither podman nor docker found on PATH" >&2
+  exit 1
+fi
+"""
+
+[tasks.ci]
+description = "Run all CI checks"
+depends = ["fmt:check", "clippy", "clippy:lib", "test", "build:debug", "build:lib"]
