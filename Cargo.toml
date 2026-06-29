@@ -37,7 +37,7 @@ chrono = { version = "0.4", features = ["serde"] }
 clickhouse = { version = "0.15", features = ["chrono", "rustls-tls", "uuid"] }
 include_dir = "0.7"
 serde = { version = "1", features = ["derive"] }
-sha2 = "0.10"
+sha2 = "0.11"
 sqlparser = "0.62"
 thiserror = "2"
 
