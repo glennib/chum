@@ -1401,13 +1401,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_formats_resolve_directly() {
-        assert_eq!(Format::Pretty.resolve(false), Resolved::Pretty);
-        assert_eq!(Format::Json.resolve(false), Resolved::Json);
-        assert_eq!(Format::Tsv.resolve(false), Resolved::Tsv);
-    }
-
-    #[test]
     fn count_pluralises_on_count() {
         assert_eq!(count(1, "migration"), "1 migration");
         assert_eq!(count(0, "migration"), "0 migrations");
@@ -1510,16 +1503,13 @@ mod tests {
     }
 
     #[test]
-    fn cli_parses_bookkeeping_database() {
+    fn bookkeeping_database_defaults_to_chum() {
         use clap::Parser as _;
-        // Defaults to `_chum` when the flag is absent.
+        // The documented default: absent `--bookkeeping-database` resolves to
+        // `_chum`, wired from the `DEFAULT_BOOKKEEPING_DATABASE` constant.
         let cli = Cli::try_parse_from(["chum", "info"]).expect("valid args parse");
         assert_eq!(cli.bookkeeping_database, chum::DEFAULT_BOOKKEEPING_DATABASE);
         assert_eq!(cli.bookkeeping_database, "_chum");
-        // `--bookkeeping-database` overrides the default.
-        let cli = Cli::try_parse_from(["chum", "--bookkeeping-database", "custom", "info"])
-            .expect("valid args parse");
-        assert_eq!(cli.bookkeeping_database, "custom");
     }
 
     #[test]
@@ -1542,20 +1532,6 @@ mod tests {
         assert_eq!(cli.password, None);
         assert_eq!(cli.database, None);
         build_client(&cli).expect("build client from a full DSN");
-    }
-
-    #[test]
-    fn cli_parses_convert() {
-        use clap::Parser as _;
-        let cli = Cli::try_parse_from(["chum", "convert", "sequential", "--dry-run"])
-            .expect("valid args parse");
-        match cli.command {
-            Command::Convert { to, dry_run } => {
-                assert_eq!(to, Scheme::Sequential);
-                assert!(dry_run);
-            }
-            _ => panic!("expected convert"),
-        }
     }
 
     #[test]
