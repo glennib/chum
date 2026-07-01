@@ -19,17 +19,24 @@
 //! use std::path::Path;
 //!
 //! use chum::Migrator;
+//! use chum::backend::Bookkeeping;
 //! use chum::source;
 //!
 //! # async fn run() -> chum::Result<()> {
 //! let migrator = Migrator::new(source::from_path(
 //!     Path::new("migrations"),
 //! )?);
+//! // The client is connected with no app database pinned as the session
+//! // default, so migrations can create and fully-qualify their own databases.
 //! let client = clickhouse::Client::default()
 //!     .with_url("http://localhost:8123");
-//! migrator
-//!     .run(&client, chum::DEFAULT_TABLE, None)
-//!     .await?;
+//! // Bookkeeping lives in its own database (default `_chum`), fully-qualified
+//! // as `_chum._chum_migrations` — independent of any app database.
+//! let bookkeeping = Bookkeeping::new(
+//!     chum::DEFAULT_BOOKKEEPING_DATABASE,
+//!     chum::DEFAULT_TABLE,
+//! )?;
+//! migrator.run(&client, &bookkeeping, None).await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -53,6 +60,15 @@ pub mod split;
 /// The default name of the bookkeeping table recording applied migrations.
 pub const DEFAULT_TABLE: &str = "_chum_migrations";
 
+/// The default name of the dedicated database that holds the bookkeeping table.
+///
+/// Bookkeeping lives in its own database (fully-qualified as
+/// `<database>.<table>`) so it never depends on the app database — the
+/// connection's session default — existing. This lets a migration create and
+/// fully-qualify its own database.
+pub const DEFAULT_BOOKKEEPING_DATABASE: &str = "_chum";
+
+pub use backend::Bookkeeping;
 pub use error::ChumError;
 pub use error::Result;
 pub use migration::AppliedMigration;

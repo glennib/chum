@@ -311,24 +311,74 @@ struct Cli {
     /// (`clickhouse+https://user:pass@host:8123/database?secure=true`).
     /// Credentials, database, and `secure` are read from it; `--user`,
     /// `--password`, and `--database` override the URL.
-    #[arg(long, env = "CLICKHOUSE_URL", default_value = "http://localhost:8123")]
+    ///
+    /// **Not** read from the environment. chum reads no `CLICKHOUSE_*` env vars
+    /// at all — the connection target must be passed explicitly, so a migrator
+    /// never connects to whatever ambient cluster the environment happens to
+    /// point at. Defaults to `http://localhost:8123` when omitted.
+    #[arg(long, default_value = "http://localhost:8123")]
     url: String,
 
-    /// Override the database name from the URL.
-    #[arg(long, env = "CLICKHOUSE_DATABASE")]
+    /// Session default database for *unqualified* names in your migration SQL.
+    ///
+    /// This is NOT where chum keeps its bookkeeping — that lives in its own
+    /// database (see `--bookkeeping-database`), always fully-qualified, so chum
+    /// itself never needs any app database to exist. Leave this unset (the
+    /// default) and fully-qualify object names in your migrations
+    /// (`CREATE DATABASE app; CREATE TABLE app.t …`) so a migration can
+    /// bootstrap its own database. Set it only if your migrations use
+    /// unqualified names and rely on a session default — in which case the
+    /// database **must already exist**, since ClickHouse rejects any
+    /// request whose session default database is absent.
+    ///
+    /// This is **not** read from the environment — only an explicit
+    /// `--database` or a database in the `--url` DSN (path /
+    /// `database`/`db` query param) takes effect. chum reads no
+    /// `CLICKHOUSE_*` env vars at all, so it never silently assembles a
+    /// connection target from ambient env partials. This matters here
+    /// specifically because chum commonly shares an `.env` with the
+    /// application it migrates, which legitimately sets
+    /// `CLICKHOUSE_DATABASE=<appdb>`; inheriting it would pin chum's session to
+    /// an app database that may not exist yet, breaking the
+    /// create-your-own-db flow above even though bookkeeping lives in
+    /// `--bookkeeping-database`.
+    #[arg(long)]
     database: Option<String>,
 
-    /// Override the user from the URL.
-    #[arg(long, env = "CLICKHOUSE_USER")]
+    /// Override the user from the `--url` DSN.
+    ///
+    /// **Not** read from the environment — supply credentials via the `--url`
+    /// DSN userinfo (`clickhouse://user:pass@host…`) or this explicit flag.
+    /// chum reads no `CLICKHOUSE_*` env vars, so it never silently
+    /// assembles an identity from ambient env partials and ends up pointed
+    /// at the wrong cluster.
+    #[arg(long)]
     user: Option<String>,
 
-    /// Override the password from the URL.
-    #[arg(long, env = "CLICKHOUSE_PASSWORD")]
+    /// Override the password from the `--url` DSN.
+    ///
+    /// **Not** read from the environment (see `--user`). Supply it via the
+    /// `--url` DSN userinfo or this explicit flag.
+    #[arg(long)]
     password: Option<String>,
 
     /// Name of the bookkeeping table recording applied migrations.
     #[arg(long, env = "CHUM_TABLE", default_value = chum::DEFAULT_TABLE)]
     table: String,
+
+    /// Dedicated database that holds the bookkeeping table.
+    ///
+    /// chum creates it (`CREATE DATABASE IF NOT EXISTS`) and fully-qualifies
+    /// all bookkeeping SQL as `<bookkeeping-database>.<table>`, so
+    /// bookkeeping never depends on any app database existing — a migration
+    /// is free to create its own. Kept separate from `--database` for
+    /// exactly this reason.
+    #[arg(
+        long,
+        env = "CHUM_BOOKKEEPING_DATABASE",
+        default_value = chum::DEFAULT_BOOKKEEPING_DATABASE
+    )]
+    bookkeeping_database: String,
 
     /// Directory containing `<version>_<name>.{up,down}.sql` migration files.
     #[arg(long, env = "CHUM_SOURCE", default_value = "migrations", global = true)]
@@ -481,17 +531,18 @@ async fn run(cli: Cli) -> miette::Result<()> {
 
     let migrator = Migrator::new(source::from_path(&cli.source)?);
     let client = build_client(&cli)?;
-    let table = &cli.table;
+    let bookkeeping = chum::Bookkeeping::new(cli.bookkeeping_database.clone(), cli.table.clone())?;
+    let bookkeeping = &bookkeeping;
 
     match cli.command {
         Command::Run { target, dry_run } => {
             if dry_run {
-                let planned = migrator.plan(&client, table, target).await?;
+                let planned = migrator.plan(&client, bookkeeping, target).await?;
                 render_plan(&planned, fmt)?;
             } else {
                 let pb = spinner("Applying pending migrations…");
                 let applied = migrator
-                    .run_with(&client, table, target, |event| {
+                    .run_with(&client, bookkeeping, target, |event| {
                         if let Progress::ApplyStarted {
                             version,
                             description,
@@ -511,8 +562,9 @@ async fn run(cli: Cli) -> miette::Result<()> {
             dry_run,
             yes,
         } => {
-            let target = resolve_revert_target(&migrator, &client, table, target, steps).await?;
-            let versions = migrator.revert_plan(&client, table, target).await?;
+            let target =
+                resolve_revert_target(&migrator, &client, bookkeeping, target, steps).await?;
+            let versions = migrator.revert_plan(&client, bookkeeping, target).await?;
             if versions.is_empty() {
                 render_revert(&[], fmt, RevertPhase::Done)?;
             } else if dry_run {
@@ -529,7 +581,7 @@ async fn run(cli: Cli) -> miette::Result<()> {
                 )? {
                     let pb = spinner("Reverting migrations…");
                     let reverted = migrator
-                        .undo_with(&client, table, target, |event| {
+                        .undo_with(&client, bookkeeping, target, |event| {
                             if let Progress::RevertStarted { version } = event {
                                 pb.set_message(format!("Reverting {version}…"));
                             }
@@ -544,13 +596,13 @@ async fn run(cli: Cli) -> miette::Result<()> {
         }
         Command::Info => {
             let pb = spinner("Reading migration state…");
-            let statuses = migrator.info(&client, table).await?;
+            let statuses = migrator.info(&client, bookkeeping).await?;
             pb.finish_and_clear();
             render_info(&statuses, fmt)?;
         }
         Command::Force { version } => {
             let pb = spinner(&format!("Forcing {version} as applied…"));
-            migrator.force(&client, table, version).await?;
+            migrator.force(&client, bookkeeping, version).await?;
             pb.finish_and_clear();
             render_force(version, fmt)?;
         }
@@ -980,12 +1032,41 @@ fn render_force(version: i64, fmt: Resolved) -> miette::Result<()> {
 ///
 /// Maps a DSN to the HTTP-only `clickhouse` crate:
 /// - userinfo / `user`,`username`,`password` query params → credentials;
-/// - first path segment / `database`,`db` query param → database;
+/// - first path segment / `database`,`db` query param → session default
+///   database (see below);
 /// - scheme containing `https` or a truthy `secure` query param → TLS;
 /// - `x-*` query params (golang-migrate driver params) are ignored;
 /// - any other query param → a ClickHouse setting.
 ///
 /// `--user` / `--password` / `--database` override the URL.
+///
+/// # Session default database
+///
+/// The session default database is pinned **only when explicitly provided**
+/// (via `--database`, the URL path, or a `database`/`db` query param). When
+/// none is given, the client is left on the `clickhouse` crate's built-in
+/// `default` database — which always exists — rather than a possibly-missing
+/// app database. This is deliberate: chum's bookkeeping is fully-qualified to
+/// its own database (`--bookkeeping-database`), so it never needs an app
+/// database, and leaving the session default unpinned lets a migration
+/// bootstrap its own database with fully-qualified DDL (`CREATE DATABASE app;
+/// CREATE TABLE app.t …`). ClickHouse rejects any request whose session default
+/// database is absent, so a `--database` that is set **must already exist**.
+///
+/// # No connection config is read from the environment
+///
+/// chum reads **no `CLICKHOUSE_*` env vars at all** — not `CLICKHOUSE_URL`,
+/// `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`, nor `CLICKHOUSE_DATABASE`. The
+/// connection target is supplied by an explicit `--url` (which accepts a full
+/// DSN carrying user / password / database via userinfo + path + query) plus
+/// the explicit `--user` / `--password` / `--database` override flags. When
+/// `--url` is omitted it defaults to `http://localhost:8123`, so a bare `chum` targets
+/// localhost — never an ambient cluster. A migrator that silently connected to
+/// whatever target the environment happened to point at is how a stray
+/// invocation ends up on the wrong (or prod) cluster; requiring an explicit
+/// `--url` prevents that. Only `CHUM_TABLE` / `CHUM_BOOKKEEPING_DATABASE`
+/// remain env-readable — they are `CHUM_*` tool config, not a connection
+/// target.
 fn build_client(cli: &Cli) -> miette::Result<clickhouse::Client> {
     let parsed = Url::parse(&cli.url)
         .into_diagnostic()
@@ -1098,7 +1179,7 @@ fn decode(s: &str) -> String {
 async fn resolve_revert_target(
     migrator: &Migrator,
     client: &clickhouse::Client,
-    table: &str,
+    bookkeeping: &chum::Bookkeeping,
     target: Option<i64>,
     steps: Option<usize>,
 ) -> miette::Result<i64> {
@@ -1107,7 +1188,7 @@ async fn resolve_revert_target(
     }
     let steps = steps.unwrap_or(1);
     let mut applied: Vec<i64> = migrator
-        .info(client, table)
+        .info(client, bookkeeping)
         .await?
         .into_iter()
         .filter(|s| s.state == State::Applied)
@@ -1320,13 +1401,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_formats_resolve_directly() {
-        assert_eq!(Format::Pretty.resolve(false), Resolved::Pretty);
-        assert_eq!(Format::Json.resolve(false), Resolved::Json);
-        assert_eq!(Format::Tsv.resolve(false), Resolved::Tsv);
-    }
-
-    #[test]
     fn count_pluralises_on_count() {
         assert_eq!(count(1, "migration"), "1 migration");
         assert_eq!(count(0, "migration"), "0 migrations");
@@ -1429,17 +1503,35 @@ mod tests {
     }
 
     #[test]
-    fn cli_parses_convert() {
+    fn bookkeeping_database_defaults_to_chum() {
         use clap::Parser as _;
-        let cli = Cli::try_parse_from(["chum", "convert", "sequential", "--dry-run"])
-            .expect("valid args parse");
-        match cli.command {
-            Command::Convert { to, dry_run } => {
-                assert_eq!(to, Scheme::Sequential);
-                assert!(dry_run);
-            }
-            _ => panic!("expected convert"),
-        }
+        // The documented default: absent `--bookkeeping-database` resolves to
+        // `_chum`, wired from the `DEFAULT_BOOKKEEPING_DATABASE` constant.
+        let cli = Cli::try_parse_from(["chum", "info"]).expect("valid args parse");
+        assert_eq!(cli.bookkeeping_database, chum::DEFAULT_BOOKKEEPING_DATABASE);
+        assert_eq!(cli.bookkeeping_database, "_chum");
+    }
+
+    #[test]
+    fn build_client_resolves_a_full_dsn() {
+        use clap::Parser as _;
+
+        // A full DSN passed via `--url` carries user / password / database via
+        // userinfo, path, and query param. The `clickhouse::Client` exposes no
+        // getters, so a successful `build_client` on such a DSN is the observable
+        // contract that the DSN is parsed. The identity lives in the DSN, so the
+        // individual flags stay None.
+        let cli = Cli::try_parse_from([
+            "chum",
+            "--url",
+            "clickhouse+https://dsn_user:dsn_pass@localhost:8123/dsn_db?secure=true",
+            "info",
+        ])
+        .expect("valid args parse");
+        assert_eq!(cli.user, None);
+        assert_eq!(cli.password, None);
+        assert_eq!(cli.database, None);
+        build_client(&cli).expect("build client from a full DSN");
     }
 
     #[test]

@@ -72,17 +72,66 @@ use crate::error::ChumError;
 use crate::error::Result;
 use crate::migration::AppliedMigration;
 
-/// Validate that a table name is a bare SQL identifier.
+/// Where chum keeps its bookkeeping: the dedicated database plus the table
+/// within it. Every bookkeeping statement is fully-qualified as
+/// `<database>.<table>`, so bookkeeping never depends on the *app* database
+/// (the connection's session default) existing — a migration is free to create
+/// its own database.
 ///
-/// Table names cannot be bound as query parameters, so they are interpolated
-/// into SQL directly; this guards against injection.
-fn validate_table(table: &str) -> Result<()> {
-    let ok = !table.is_empty() && table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+/// Both identifiers are validated at construction ([`Bookkeeping::new`]) since
+/// they are interpolated into SQL directly, not bound as query parameters.
+#[derive(Debug, Clone)]
+pub struct Bookkeeping {
+    database: String,
+    table: String,
+}
+
+impl Bookkeeping {
+    /// Build a bookkeeping target, validating both identifiers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChumError::Source`] if either identifier is not a bare
+    /// `[A-Za-z0-9_]` SQL identifier.
+    pub fn new(database: impl Into<String>, table: impl Into<String>) -> Result<Self> {
+        let database = database.into();
+        let table = table.into();
+        validate_ident(&database, "bookkeeping database")?;
+        validate_ident(&table, "bookkeeping table")?;
+        Ok(Self { database, table })
+    }
+
+    /// The bookkeeping database name.
+    #[must_use]
+    pub fn database(&self) -> &str {
+        &self.database
+    }
+
+    /// The bookkeeping table name (unqualified).
+    #[must_use]
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
+    /// The fully-qualified `<database>.<table>` reference used in SQL.
+    #[must_use]
+    fn qualified(&self) -> String {
+        format!("{}.{}", self.database, self.table)
+    }
+}
+
+/// Validate that `ident` is a bare SQL identifier.
+///
+/// Database and table names cannot be bound as query parameters, so they are
+/// interpolated into SQL directly; this guards against injection. `kind` names
+/// the identifier in the error message (e.g. `"bookkeeping table"`).
+fn validate_ident(ident: &str, kind: &str) -> Result<()> {
+    let ok = !ident.is_empty() && ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
     if ok {
         Ok(())
     } else {
         Err(ChumError::Source(format!(
-            "invalid bookkeeping table name {table:?}: expected [A-Za-z0-9_]"
+            "invalid {kind} name {ident:?}: expected [A-Za-z0-9_]"
         )))
     }
 }
@@ -99,16 +148,35 @@ struct AppliedRow {
     success: bool,
 }
 
-/// Create the bookkeeping table if it does not already exist.
+/// Create the bookkeeping database if it does not already exist.
 ///
-/// Unlike user migrations (which deliberately omit `IF NOT EXISTS`), this is
-/// chum's internal table and is created idempotently on every run.
+/// This runs before [`ensure_table`] so the fully-qualified bookkeeping table
+/// has a database to live in. Like the table, it is chum's own object and is
+/// created idempotently on every run (unlike user migrations, which
+/// deliberately omit `IF NOT EXISTS`). It never depends on the app database, so
+/// a migration is free to create its own.
 ///
 /// # Errors
 ///
 /// Returns [`ChumError::ClickHouse`] if the DDL fails.
-pub async fn ensure_table(client: &clickhouse::Client, table: &str) -> Result<()> {
-    validate_table(table)?;
+pub async fn ensure_database(client: &clickhouse::Client, bookkeeping: &Bookkeeping) -> Result<()> {
+    let ddl = format!("CREATE DATABASE IF NOT EXISTS {}", bookkeeping.database);
+    client.query(&ddl).execute().await?;
+    Ok(())
+}
+
+/// Create the bookkeeping table if it does not already exist.
+///
+/// Unlike user migrations (which deliberately omit `IF NOT EXISTS`), this is
+/// chum's internal table and is created idempotently on every run. The table is
+/// fully-qualified to the bookkeeping database, so [`ensure_database`] must run
+/// first.
+///
+/// # Errors
+///
+/// Returns [`ChumError::ClickHouse`] if the DDL fails.
+pub async fn ensure_table(client: &clickhouse::Client, bookkeeping: &Bookkeeping) -> Result<()> {
+    let table = bookkeeping.qualified();
     let ddl = format!(
         "CREATE TABLE IF NOT EXISTS {table}
          (
@@ -134,9 +202,9 @@ pub async fn ensure_table(client: &clickhouse::Client, table: &str) -> Result<()
 /// Returns [`ChumError::ClickHouse`] if the query fails.
 pub async fn list_applied(
     client: &clickhouse::Client,
-    table: &str,
+    bookkeeping: &Bookkeeping,
 ) -> Result<Vec<AppliedMigration>> {
-    validate_table(table)?;
+    let table = bookkeeping.qualified();
     let sql = format!(
         "SELECT version,
                 argMax(description, seq)  AS description,
@@ -172,14 +240,14 @@ pub async fn list_applied(
 /// Returns [`ChumError::ClickHouse`] if the insert fails.
 pub async fn record(
     client: &clickhouse::Client,
-    table: &str,
+    bookkeeping: &Bookkeeping,
     version: i64,
     description: &str,
     checksum: &str,
     execution_ms: u64,
     success: bool,
 ) -> Result<()> {
-    validate_table(table)?;
+    let table = bookkeeping.qualified();
     let sql = format!(
         "INSERT INTO {table}
              (version, description, checksum, execution_ms, success, seq)
@@ -202,9 +270,44 @@ pub async fn record(
 /// # Errors
 ///
 /// Returns [`ChumError::ClickHouse`] if the delete fails.
-pub async fn delete_version(client: &clickhouse::Client, table: &str, version: i64) -> Result<()> {
-    validate_table(table)?;
+pub async fn delete_version(
+    client: &clickhouse::Client,
+    bookkeeping: &Bookkeeping,
+    version: i64,
+) -> Result<()> {
+    let table = bookkeeping.qualified();
     let sql = format!("DELETE FROM {table} WHERE version = ?");
     client.query(&sql).bind(version).execute().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Bookkeeping;
+
+    #[test]
+    fn bookkeeping_new_accepts_bare_identifiers_and_qualifies() {
+        let bk = Bookkeeping::new("_chum", "_chum_migrations").expect("valid identifiers");
+        assert_eq!(bk.database(), "_chum");
+        assert_eq!(bk.table(), "_chum_migrations");
+        assert_eq!(bk.qualified(), "_chum._chum_migrations");
+    }
+
+    #[test]
+    fn bookkeeping_new_rejects_injection_and_empty_identifiers() {
+        // The database and table are interpolated into SQL, so anything that is
+        // not a bare `[A-Za-z0-9_]` identifier must be rejected at construction.
+        assert!(Bookkeeping::new("a.b", "t").is_err(), "dotted database");
+        assert!(Bookkeeping::new("db", "a.b").is_err(), "dotted table");
+        assert!(Bookkeeping::new("", "t").is_err(), "empty database");
+        assert!(Bookkeeping::new("db", "").is_err(), "empty table");
+        assert!(
+            Bookkeeping::new("db; DROP DATABASE x", "t").is_err(),
+            "injection attempt"
+        );
+        assert!(
+            Bookkeeping::new("db", "t`").is_err(),
+            "backtick in identifier"
+        );
+    }
 }

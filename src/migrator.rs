@@ -7,6 +7,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::backend;
+use crate::backend::Bookkeeping;
 use crate::error::ChumError;
 use crate::error::Result;
 use crate::migration::AppliedMigration;
@@ -158,10 +159,10 @@ impl Migrator {
     pub async fn run(
         &self,
         client: &clickhouse::Client,
-        table: &str,
+        bookkeeping: &Bookkeeping,
         target: Option<i64>,
     ) -> Result<Vec<Applied>> {
-        self.run_with(client, table, target, |_| {}).await
+        self.run_with(client, bookkeeping, target, |_| {}).await
     }
 
     /// Like [`Migrator::run`], but reports progress through `on_progress`
@@ -175,15 +176,16 @@ impl Migrator {
     pub async fn run_with<F>(
         &self,
         client: &clickhouse::Client,
-        table: &str,
+        bookkeeping: &Bookkeeping,
         target: Option<i64>,
         mut on_progress: F,
     ) -> Result<Vec<Applied>>
     where
         F: FnMut(Progress<'_>),
     {
-        backend::ensure_table(client, table).await?;
-        let applied = self.validated_applied(client, table).await?;
+        backend::ensure_database(client, bookkeeping).await?;
+        backend::ensure_table(client, bookkeeping).await?;
+        let applied = self.validated_applied(client, bookkeeping).await?;
 
         let mut report = Vec::new();
         for migration in self.ups() {
@@ -199,7 +201,7 @@ impl Migrator {
                     version: migration.version,
                     description: migration.description.as_ref(),
                 });
-                let elapsed = self.apply(client, table, migration).await?;
+                let elapsed = self.apply(client, bookkeeping, migration).await?;
                 on_progress(Progress::ApplyFinished {
                     version: migration.version,
                     description: migration.description.as_ref(),
@@ -227,11 +229,12 @@ impl Migrator {
     pub async fn plan(
         &self,
         client: &clickhouse::Client,
-        table: &str,
+        bookkeeping: &Bookkeeping,
         target: Option<i64>,
     ) -> Result<Vec<Planned>> {
-        backend::ensure_table(client, table).await?;
-        let applied = self.validated_applied(client, table).await?;
+        backend::ensure_database(client, bookkeeping).await?;
+        backend::ensure_table(client, bookkeeping).await?;
+        let applied = self.validated_applied(client, bookkeeping).await?;
 
         let mut planned = Vec::new();
         for migration in self.ups() {
@@ -262,10 +265,10 @@ impl Migrator {
     pub async fn undo(
         &self,
         client: &clickhouse::Client,
-        table: &str,
+        bookkeeping: &Bookkeeping,
         target: i64,
     ) -> Result<Vec<i64>> {
-        self.undo_with(client, table, target, |_| {}).await
+        self.undo_with(client, bookkeeping, target, |_| {}).await
     }
 
     /// Like [`Migrator::undo`], but reports progress through `on_progress`
@@ -280,15 +283,16 @@ impl Migrator {
     pub async fn undo_with<F>(
         &self,
         client: &clickhouse::Client,
-        table: &str,
+        bookkeeping: &Bookkeeping,
         target: i64,
         mut on_progress: F,
     ) -> Result<Vec<i64>>
     where
         F: FnMut(Progress<'_>),
     {
-        backend::ensure_table(client, table).await?;
-        let applied = self.validated_applied(client, table).await?;
+        backend::ensure_database(client, bookkeeping).await?;
+        backend::ensure_table(client, bookkeeping).await?;
+        let applied = self.validated_applied(client, bookkeeping).await?;
 
         let mut versions: Vec<i64> = applied
             .values()
@@ -309,7 +313,7 @@ impl Migrator {
             for stmt in &statements {
                 client.query(stmt).execute().await?;
             }
-            backend::delete_version(client, table, version).await?;
+            backend::delete_version(client, bookkeeping, version).await?;
             on_progress(Progress::RevertFinished { version });
             reverted.push(version);
         }
@@ -329,11 +333,12 @@ impl Migrator {
     pub async fn revert_plan(
         &self,
         client: &clickhouse::Client,
-        table: &str,
+        bookkeeping: &Bookkeeping,
         target: i64,
     ) -> Result<Vec<i64>> {
-        backend::ensure_table(client, table).await?;
-        let applied = self.validated_applied(client, table).await?;
+        backend::ensure_database(client, bookkeeping).await?;
+        backend::ensure_table(client, bookkeeping).await?;
+        let applied = self.validated_applied(client, bookkeeping).await?;
 
         let mut versions: Vec<i64> = applied
             .values()
@@ -362,16 +367,17 @@ impl Migrator {
     pub async fn force(
         &self,
         client: &clickhouse::Client,
-        table: &str,
+        bookkeeping: &Bookkeeping,
         version: i64,
     ) -> Result<()> {
-        backend::ensure_table(client, table).await?;
+        backend::ensure_database(client, bookkeeping).await?;
+        backend::ensure_table(client, bookkeeping).await?;
         let migration = self
             .up(version)
             .ok_or_else(|| ChumError::Source(format!("unknown migration version {version}")))?;
         backend::record(
             client,
-            table,
+            bookkeeping,
             version,
             &migration.description,
             &migration.checksum,
@@ -387,9 +393,14 @@ impl Migrator {
     /// # Errors
     ///
     /// See [`ChumError`].
-    pub async fn info(&self, client: &clickhouse::Client, table: &str) -> Result<Vec<Status>> {
-        backend::ensure_table(client, table).await?;
-        let applied: HashMap<i64, AppliedMigration> = backend::list_applied(client, table)
+    pub async fn info(
+        &self,
+        client: &clickhouse::Client,
+        bookkeeping: &Bookkeeping,
+    ) -> Result<Vec<Status>> {
+        backend::ensure_database(client, bookkeeping).await?;
+        backend::ensure_table(client, bookkeeping).await?;
+        let applied: HashMap<i64, AppliedMigration> = backend::list_applied(client, bookkeeping)
             .await?
             .into_iter()
             .map(|m| (m.version, m))
@@ -426,9 +437,9 @@ impl Migrator {
     async fn validated_applied(
         &self,
         client: &clickhouse::Client,
-        table: &str,
+        bookkeeping: &Bookkeeping,
     ) -> Result<HashMap<i64, AppliedMigration>> {
-        let applied = backend::list_applied(client, table).await?;
+        let applied = backend::list_applied(client, bookkeeping).await?;
 
         if let Some(dirty) = applied
             .iter()
@@ -454,7 +465,7 @@ impl Migrator {
     async fn apply(
         &self,
         client: &clickhouse::Client,
-        table: &str,
+        bookkeeping: &Bookkeeping,
         migration: &Migration,
     ) -> Result<Duration> {
         let version = migration.version;
@@ -463,7 +474,7 @@ impl Migrator {
 
         backend::record(
             client,
-            table,
+            bookkeeping,
             version,
             &migration.description,
             &migration.checksum,
@@ -481,7 +492,7 @@ impl Migrator {
         let ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
         backend::record(
             client,
-            table,
+            bookkeeping,
             version,
             &migration.description,
             &migration.checksum,

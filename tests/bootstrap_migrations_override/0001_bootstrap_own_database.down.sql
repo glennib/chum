@@ -1,0 +1,1 @@
+DROP DATABASE chum_bootstrap_app_override;
