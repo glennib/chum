@@ -311,7 +311,12 @@ struct Cli {
     /// (`clickhouse+https://user:pass@host:8123/database?secure=true`).
     /// Credentials, database, and `secure` are read from it; `--user`,
     /// `--password`, and `--database` override the URL.
-    #[arg(long, env = "CLICKHOUSE_URL", default_value = "http://localhost:8123")]
+    ///
+    /// **Not** read from the environment. chum reads no `CLICKHOUSE_*` env vars
+    /// at all — the connection target must be passed explicitly, so a migrator
+    /// never connects to whatever ambient cluster the environment happens to
+    /// point at. Defaults to `http://localhost:8123` when omitted.
+    #[arg(long, default_value = "http://localhost:8123")]
     url: String,
 
     /// Session default database for *unqualified* names in your migration SQL.
@@ -324,17 +329,37 @@ struct Cli {
     /// bootstrap its own database. Set it only if your migrations use
     /// unqualified names and rely on a session default — in which case the
     /// database **must already exist**, since ClickHouse rejects any
-    /// request whose session default database is absent. Overrides the
-    /// database in `--url`.
-    #[arg(long, env = "CLICKHOUSE_DATABASE")]
+    /// request whose session default database is absent.
+    ///
+    /// This is **not** read from the environment — only an explicit
+    /// `--database` or a database in the `--url` DSN (path /
+    /// `database`/`db` query param) takes effect. chum reads no
+    /// `CLICKHOUSE_*` env vars at all, so it never silently assembles a
+    /// connection target from ambient env partials. This matters here
+    /// specifically because chum commonly shares an `.env` with the
+    /// application it migrates, which legitimately sets
+    /// `CLICKHOUSE_DATABASE=<appdb>`; inheriting it would pin chum's session to
+    /// an app database that may not exist yet, breaking the
+    /// create-your-own-db flow above even though bookkeeping lives in
+    /// `--bookkeeping-database`.
+    #[arg(long)]
     database: Option<String>,
 
-    /// Override the user from the URL.
-    #[arg(long, env = "CLICKHOUSE_USER")]
+    /// Override the user from the `--url` DSN.
+    ///
+    /// **Not** read from the environment — supply credentials via the `--url`
+    /// DSN userinfo (`clickhouse://user:pass@host…`) or this explicit flag.
+    /// chum reads no `CLICKHOUSE_*` env vars, so it never silently
+    /// assembles an identity from ambient env partials and ends up pointed
+    /// at the wrong cluster.
+    #[arg(long)]
     user: Option<String>,
 
-    /// Override the password from the URL.
-    #[arg(long, env = "CLICKHOUSE_PASSWORD")]
+    /// Override the password from the `--url` DSN.
+    ///
+    /// **Not** read from the environment (see `--user`). Supply it via the
+    /// `--url` DSN userinfo or this explicit flag.
+    #[arg(long)]
     password: Option<String>,
 
     /// Name of the bookkeeping table recording applied migrations.
@@ -1027,6 +1052,21 @@ fn render_force(version: i64, fmt: Resolved) -> miette::Result<()> {
 /// bootstrap its own database with fully-qualified DDL (`CREATE DATABASE app;
 /// CREATE TABLE app.t …`). ClickHouse rejects any request whose session default
 /// database is absent, so a `--database` that is set **must already exist**.
+///
+/// # No connection config is read from the environment
+///
+/// chum reads **no `CLICKHOUSE_*` env vars at all** — not `CLICKHOUSE_URL`,
+/// `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`, nor `CLICKHOUSE_DATABASE`. The
+/// connection target is supplied by an explicit `--url` (which accepts a full
+/// DSN carrying user / password / database via userinfo + path + query) plus
+/// the explicit `--user` / `--password` / `--database` override flags. When
+/// `--url` is omitted it defaults to `http://localhost:8123`, so a bare `chum` targets
+/// localhost — never an ambient cluster. A migrator that silently connected to
+/// whatever target the environment happened to point at is how a stray
+/// invocation ends up on the wrong (or prod) cluster; requiring an explicit
+/// `--url` prevents that. Only `CHUM_TABLE` / `CHUM_BOOKKEEPING_DATABASE`
+/// remain env-readable — they are `CHUM_*` tool config, not a connection
+/// target.
 fn build_client(cli: &Cli) -> miette::Result<clickhouse::Client> {
     let parsed = Url::parse(&cli.url)
         .into_diagnostic()
@@ -1480,6 +1520,97 @@ mod tests {
         let cli = Cli::try_parse_from(["chum", "--bookkeeping-database", "custom", "info"])
             .expect("valid args parse");
         assert_eq!(cli.bookkeeping_database, "custom");
+    }
+
+    #[test]
+    fn connection_config_is_not_read_from_the_environment() {
+        use clap::Parser as _;
+
+        // Save and set all four `CLICKHOUSE_*` connection env vars. An
+        // application sharing chum's `.env` legitimately sets these; chum reads
+        // NONE of them. The four flags have no `env` binding, so no other code
+        // path (or parallel test) reads them — the process-global mutation is
+        // inert elsewhere; still, restore the ambient environment on the way out.
+        //
+        // SAFETY: the vars are not read by any concurrently-running thread (no
+        // clap `env` binding references them), so set/remove here is sound.
+        let vars = [
+            "CLICKHOUSE_URL",
+            "CLICKHOUSE_DATABASE",
+            "CLICKHOUSE_USER",
+            "CLICKHOUSE_PASSWORD",
+        ];
+        let saved = vars.map(|k| (k, std::env::var_os(k)));
+        unsafe {
+            std::env::set_var("CLICKHOUSE_URL", "http://ambient-host-from-env:9999");
+            std::env::set_var("CLICKHOUSE_DATABASE", "appdb_from_env");
+            std::env::set_var("CLICKHOUSE_USER", "user_from_env");
+            std::env::set_var("CLICKHOUSE_PASSWORD", "password_from_env");
+        }
+
+        // Nothing is inherited: `--url` falls back to the localhost default (not
+        // the ambient env value), and user/password/database resolve to None.
+        let cli = Cli::try_parse_from(["chum", "info"]).expect("valid args parse");
+        assert_eq!(
+            cli.url, "http://localhost:8123",
+            "CLICKHOUSE_URL must not be inherited; --url uses its localhost default"
+        );
+        assert_eq!(
+            cli.database, None,
+            "CLICKHOUSE_DATABASE must not be inherited"
+        );
+        assert_eq!(cli.user, None, "CLICKHOUSE_USER must not be inherited");
+        assert_eq!(
+            cli.password, None,
+            "CLICKHOUSE_PASSWORD must not be inherited"
+        );
+
+        // Explicit flags still take effect.
+        let cli = Cli::try_parse_from([
+            "chum",
+            "--url",
+            "http://explicit-host:8123",
+            "--database",
+            "explicit_db",
+            "--user",
+            "explicit_user",
+            "--password",
+            "explicit_password",
+            "info",
+        ])
+        .expect("valid args parse");
+        assert_eq!(cli.url, "http://explicit-host:8123");
+        assert_eq!(cli.database.as_deref(), Some("explicit_db"));
+        assert_eq!(cli.user.as_deref(), Some("explicit_user"));
+        assert_eq!(cli.password.as_deref(), Some("explicit_password"));
+
+        // A full DSN passed via an explicit `--url` still populates user /
+        // password / database. The `clickhouse::Client` exposes no getters, so a
+        // successful `build_client` on a DSN carrying all three is the observable
+        // contract that the DSN is still parsed.
+        let cli = Cli::try_parse_from([
+            "chum",
+            "--url",
+            "clickhouse+https://dsn_user:dsn_pass@localhost:8123/dsn_db?secure=true",
+            "info",
+        ])
+        .expect("valid args parse");
+        // The flags themselves stay None — the identity lives in the DSN, which
+        // build_client resolves.
+        assert_eq!(cli.user, None);
+        assert_eq!(cli.password, None);
+        assert_eq!(cli.database, None);
+        build_client(&cli).expect("build client from a full DSN");
+
+        // Restore the ambient environment.
+        unsafe {
+            for (k, v) in saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
     }
 
     #[test]

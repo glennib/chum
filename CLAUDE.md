@@ -127,6 +127,22 @@ version for code changes:
   the session default for *unqualified* names in migration SQL, not where
   bookkeeping goes. The intended model is that migrations fully-qualify their own
   object names and leave `--database` unset.
+- **chum reads NO `CLICKHOUSE_*` env vars** — none of `--url`, `--user`,
+  `--password`, `--database` carries a clap `env` binding, so no connection
+  config is inherited from the environment. The connection target is supplied by
+  an explicit `--url` (a full DSN can carry user/password/database via
+  userinfo/path/query) plus the explicit override flags; `--url` keeps its
+  `http://localhost:8123` default, so a bare `chum` targets localhost, never an
+  ambient cluster. Rationale: a migrator must not silently connect to whatever
+  target the environment points at (that's how a stray invocation hits the wrong
+  or prod cluster), and it matters especially for the database — chum commonly
+  shares an `.env` with the app it migrates, which sets
+  `CLICKHOUSE_DATABASE=<appdb>`; inheriting it would pin the session to a
+  possibly-missing app db and break the create-your-own-db flow. The database
+  resolution in `build_client` is `cli.database.or(path_database).or(database_q)`
+  — `cli.database` (and `cli.user`/`cli.password`/`cli.url`) are populated only
+  from the CLI. **Only `CHUM_TABLE` / `CHUM_BOOKKEEPING_DATABASE` (`CHUM_*` tool
+  config) stay env-readable.**
 - **Bookkeeping engine is `MergeTree`** so one DDL works on both single-node and
   `Replicated` ClickHouse (auto-promoted to `ReplicatedMergeTree`).
 - **Append-only state** — each apply writes a `success = false` marker, runs the

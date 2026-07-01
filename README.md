@@ -136,10 +136,10 @@ variables:
 
 | Flag | Env | Default | Notes |
 |------|-----|---------|-------|
-| `--url` | `CLICKHOUSE_URL` | `http://localhost:8123` | Bare endpoint or full DSN (see below) |
-| `--database` | `CLICKHOUSE_DATABASE` | — | Session default database for **unqualified** names in your migration SQL — *not* where bookkeeping lives (see below). If set, it must already exist. |
-| `--user` | `CLICKHOUSE_USER` | — | Overrides the user in the URL |
-| `--password` | `CLICKHOUSE_PASSWORD` | — | Overrides the password in the URL |
+| `--url` | *(none)* | `http://localhost:8123` | Bare endpoint or full DSN (see below). Explicit flag only — **not** read from the environment. |
+| `--database` | *(none)* | — | Session default database for **unqualified** names in your migration SQL — *not* where bookkeeping lives (see below). Explicit flag or DSN only — **not** read from the environment. If set, it must already exist. |
+| `--user` | *(none)* | — | Overrides the user in the URL. Explicit flag or DSN only — **not** read from the environment. |
+| `--password` | *(none)* | — | Overrides the password in the URL. Explicit flag or DSN only — **not** read from the environment. |
 | `--table` | `CHUM_TABLE` | `_chum_migrations` | Bookkeeping table name |
 | `--bookkeeping-database` | `CHUM_BOOKKEEPING_DATABASE` | `_chum` | Dedicated database holding the bookkeeping table; chum creates it |
 | `--source` | `CHUM_SOURCE` | `migrations` | Migration directory |
@@ -160,6 +160,30 @@ the HTTP-only `clickhouse` client:
 
 `--user` / `--password` / `--database` override whatever the URL provides. Set
 `RUST_LOG` to control log verbosity (default `info`).
+
+### chum reads no `CLICKHOUSE_*` environment variables
+
+chum reads **no `CLICKHOUSE_*` environment variables at all** — not
+`CLICKHOUSE_URL`, `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`, nor
+`CLICKHOUSE_DATABASE`. The connection is supplied entirely by an explicit
+`--url` (which accepts a full DSN carrying user / password / database via the
+DSN userinfo, path, and `database`/`db` query param) plus the explicit `--user`
+/ `--password` / `--database` override flags. When `--url` is omitted it
+defaults to `http://localhost:8123`, so a bare `chum` targets localhost — never
+an ambient cluster.
+
+This is deliberate. A migrator that silently connected to whatever target the
+environment happened to point at — or assembled one from scattered ambient
+`CLICKHOUSE_*` partials — is how a stray invocation ends up on the wrong (or
+production) cluster. Requiring an explicit `--url` (plus explicit override
+flags) prevents that. It also matters for the database specifically: chum
+commonly shares an `.env` with the application it migrates, which legitimately
+sets `CLICKHOUSE_DATABASE=<appdb>`; inheriting it would pin chum's session to an
+app database that may not exist yet, breaking the create-your-own-database flow
+(below) even though bookkeeping lives in `--bookkeeping-database`.
+
+Only `CHUM_TABLE` and `CHUM_BOOKKEEPING_DATABASE` are env-readable — those are
+`CHUM_*` tool config, not part of the connection target.
 
 ### `--database` vs `--bookkeeping-database`
 
@@ -186,7 +210,9 @@ migration bootstrap its own database:
   with no `--database` and no database pre-created. Set `--database` only if
   your migrations rely on unqualified names against an existing session default
   — in which case that database **must already exist**, because ClickHouse
-  rejects any request whose session default database is absent.
+  rejects any request whose session default database is absent. `--database`
+  must be passed explicitly (or via the URL); it is never inherited from
+  `CLICKHOUSE_DATABASE` in the environment.
 
 ## Library
 
@@ -275,7 +301,7 @@ These need no table-DDL or cluster-config change — replication itself is
 supplied by the `Replicated` database engine. On a single node they are inert
 no-ops. The cross-replica guarantees are documented ClickHouse behavior but are
 **not yet exercised against the Aiven cluster**. Any of them can be overridden
-with a `?setting=value` query param on `--url` / `CLICKHOUSE_URL`.
+with a `?setting=value` query param on `--url`.
 
 ## Tests
 
