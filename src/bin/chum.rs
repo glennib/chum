@@ -314,7 +314,18 @@ struct Cli {
     #[arg(long, env = "CLICKHOUSE_URL", default_value = "http://localhost:8123")]
     url: String,
 
-    /// Override the database name from the URL.
+    /// Session default database for *unqualified* names in your migration SQL.
+    ///
+    /// This is NOT where chum keeps its bookkeeping — that lives in its own
+    /// database (see `--bookkeeping-database`), always fully-qualified, so chum
+    /// itself never needs any app database to exist. Leave this unset (the
+    /// default) and fully-qualify object names in your migrations
+    /// (`CREATE DATABASE app; CREATE TABLE app.t …`) so a migration can
+    /// bootstrap its own database. Set it only if your migrations use
+    /// unqualified names and rely on a session default — in which case the
+    /// database **must already exist**, since ClickHouse rejects any
+    /// request whose session default database is absent. Overrides the
+    /// database in `--url`.
     #[arg(long, env = "CLICKHOUSE_DATABASE")]
     database: Option<String>,
 
@@ -329,6 +340,20 @@ struct Cli {
     /// Name of the bookkeeping table recording applied migrations.
     #[arg(long, env = "CHUM_TABLE", default_value = chum::DEFAULT_TABLE)]
     table: String,
+
+    /// Dedicated database that holds the bookkeeping table.
+    ///
+    /// chum creates it (`CREATE DATABASE IF NOT EXISTS`) and fully-qualifies
+    /// all bookkeeping SQL as `<bookkeeping-database>.<table>`, so
+    /// bookkeeping never depends on any app database existing — a migration
+    /// is free to create its own. Kept separate from `--database` for
+    /// exactly this reason.
+    #[arg(
+        long,
+        env = "CHUM_BOOKKEEPING_DATABASE",
+        default_value = chum::DEFAULT_BOOKKEEPING_DATABASE
+    )]
+    bookkeeping_database: String,
 
     /// Directory containing `<version>_<name>.{up,down}.sql` migration files.
     #[arg(long, env = "CHUM_SOURCE", default_value = "migrations", global = true)]
@@ -481,17 +506,18 @@ async fn run(cli: Cli) -> miette::Result<()> {
 
     let migrator = Migrator::new(source::from_path(&cli.source)?);
     let client = build_client(&cli)?;
-    let table = &cli.table;
+    let bookkeeping = chum::Bookkeeping::new(cli.bookkeeping_database.clone(), cli.table.clone())?;
+    let bookkeeping = &bookkeeping;
 
     match cli.command {
         Command::Run { target, dry_run } => {
             if dry_run {
-                let planned = migrator.plan(&client, table, target).await?;
+                let planned = migrator.plan(&client, bookkeeping, target).await?;
                 render_plan(&planned, fmt)?;
             } else {
                 let pb = spinner("Applying pending migrations…");
                 let applied = migrator
-                    .run_with(&client, table, target, |event| {
+                    .run_with(&client, bookkeeping, target, |event| {
                         if let Progress::ApplyStarted {
                             version,
                             description,
@@ -511,8 +537,9 @@ async fn run(cli: Cli) -> miette::Result<()> {
             dry_run,
             yes,
         } => {
-            let target = resolve_revert_target(&migrator, &client, table, target, steps).await?;
-            let versions = migrator.revert_plan(&client, table, target).await?;
+            let target =
+                resolve_revert_target(&migrator, &client, bookkeeping, target, steps).await?;
+            let versions = migrator.revert_plan(&client, bookkeeping, target).await?;
             if versions.is_empty() {
                 render_revert(&[], fmt, RevertPhase::Done)?;
             } else if dry_run {
@@ -529,7 +556,7 @@ async fn run(cli: Cli) -> miette::Result<()> {
                 )? {
                     let pb = spinner("Reverting migrations…");
                     let reverted = migrator
-                        .undo_with(&client, table, target, |event| {
+                        .undo_with(&client, bookkeeping, target, |event| {
                             if let Progress::RevertStarted { version } = event {
                                 pb.set_message(format!("Reverting {version}…"));
                             }
@@ -544,13 +571,13 @@ async fn run(cli: Cli) -> miette::Result<()> {
         }
         Command::Info => {
             let pb = spinner("Reading migration state…");
-            let statuses = migrator.info(&client, table).await?;
+            let statuses = migrator.info(&client, bookkeeping).await?;
             pb.finish_and_clear();
             render_info(&statuses, fmt)?;
         }
         Command::Force { version } => {
             let pb = spinner(&format!("Forcing {version} as applied…"));
-            migrator.force(&client, table, version).await?;
+            migrator.force(&client, bookkeeping, version).await?;
             pb.finish_and_clear();
             render_force(version, fmt)?;
         }
@@ -980,12 +1007,26 @@ fn render_force(version: i64, fmt: Resolved) -> miette::Result<()> {
 ///
 /// Maps a DSN to the HTTP-only `clickhouse` crate:
 /// - userinfo / `user`,`username`,`password` query params → credentials;
-/// - first path segment / `database`,`db` query param → database;
+/// - first path segment / `database`,`db` query param → session default
+///   database (see below);
 /// - scheme containing `https` or a truthy `secure` query param → TLS;
 /// - `x-*` query params (golang-migrate driver params) are ignored;
 /// - any other query param → a ClickHouse setting.
 ///
 /// `--user` / `--password` / `--database` override the URL.
+///
+/// # Session default database
+///
+/// The session default database is pinned **only when explicitly provided**
+/// (via `--database`, the URL path, or a `database`/`db` query param). When
+/// none is given, the client is left on the `clickhouse` crate's built-in
+/// `default` database — which always exists — rather than a possibly-missing
+/// app database. This is deliberate: chum's bookkeeping is fully-qualified to
+/// its own database (`--bookkeeping-database`), so it never needs an app
+/// database, and leaving the session default unpinned lets a migration
+/// bootstrap its own database with fully-qualified DDL (`CREATE DATABASE app;
+/// CREATE TABLE app.t …`). ClickHouse rejects any request whose session default
+/// database is absent, so a `--database` that is set **must already exist**.
 fn build_client(cli: &Cli) -> miette::Result<clickhouse::Client> {
     let parsed = Url::parse(&cli.url)
         .into_diagnostic()
@@ -1098,7 +1139,7 @@ fn decode(s: &str) -> String {
 async fn resolve_revert_target(
     migrator: &Migrator,
     client: &clickhouse::Client,
-    table: &str,
+    bookkeeping: &chum::Bookkeeping,
     target: Option<i64>,
     steps: Option<usize>,
 ) -> miette::Result<i64> {
@@ -1107,7 +1148,7 @@ async fn resolve_revert_target(
     }
     let steps = steps.unwrap_or(1);
     let mut applied: Vec<i64> = migrator
-        .info(client, table)
+        .info(client, bookkeeping)
         .await?
         .into_iter()
         .filter(|s| s.state == State::Applied)
@@ -1426,6 +1467,19 @@ mod tests {
         assert_eq!(v, ["20260628120007", "20260628120008", "20260628120009"]);
         assert!(v.windows(2).all(|w| w[0] < w[1]));
         assert!(v.iter().all(|s| s.as_str() < "20260628120010"));
+    }
+
+    #[test]
+    fn cli_parses_bookkeeping_database() {
+        use clap::Parser as _;
+        // Defaults to `_chum` when the flag is absent.
+        let cli = Cli::try_parse_from(["chum", "info"]).expect("valid args parse");
+        assert_eq!(cli.bookkeeping_database, chum::DEFAULT_BOOKKEEPING_DATABASE);
+        assert_eq!(cli.bookkeeping_database, "_chum");
+        // `--bookkeeping-database` overrides the default.
+        let cli = Cli::try_parse_from(["chum", "--bookkeeping-database", "custom", "info"])
+            .expect("valid args parse");
+        assert_eq!(cli.bookkeeping_database, "custom");
     }
 
     #[test]

@@ -13,10 +13,15 @@ manual and the rationale.
 
 - **Unit/integration tests**: `mise run test` (or `cargo nextest run
   --all-targets`). These need no infrastructure.
-- **End-to-end test**: `#[ignore]`d by default. Start ClickHouse with `mise run
-  db:up`, then `cargo nextest run --run-ignored all -E 'test(full_lifecycle)'`.
-  It embeds `tests/migrations/` and runs the full apply → re-run → info →
-  revert cycle against a throwaway database it creates and drops.
+- **End-to-end tests**: `#[ignore]`d by default. Start ClickHouse with `mise run
+  db:up` (compose publishes it on host port **8124**, not 8123, to avoid
+  colliding with another project's ClickHouse), then `cargo nextest run
+  --run-ignored all` (the tests default `CLICKHOUSE_URL` to
+  `http://localhost:8124`). They embed `tests/migrations/`,
+  `tests/bootstrap_migrations/`, and `tests/bootstrap_migrations_override/` and
+  cover: the full apply → re-run → info → revert cycle with bookkeeping in a
+  dedicated database; a migration that creates its **own** database with the app
+  db not pre-existing; and the `--bookkeeping-database` override.
 - **Final pre-commit check**: `mise run ci` — runs `fmt:check`, `clippy`,
   `clippy:lib`, `test`, `build:debug`, and `build:lib`. Run it after
   implementing changes and before committing; a green `mise run ci` is the bar
@@ -64,7 +69,7 @@ src/
 ├── migration.rs  # Migration, AppliedMigration, Direction, checksums
 ├── source.rs     # Migration sources: from_dir (embedded) / from_path (runtime), filename parsing
 ├── split.rs      # Statement splitter (sqlparser tokenizer → boundaries, not a full AST)
-├── backend.rs    # ClickHouse bookkeeping table: append-only inserts, argMax reads
+├── backend.rs    # ClickHouse bookkeeping: the `Bookkeeping` target (dedicated db + table), append-only inserts, argMax reads
 ├── error.rs      # ChumError (thiserror) + Result alias
 └── bin/chum.rs   # CLI: URL/DSN → client, subcommands, table/TSV/JSON output
 tests/
@@ -104,6 +109,24 @@ tests/
 These are load-bearing decisions documented at length in `README.md`; the short
 version for code changes:
 
+- **Bookkeeping lives in its own dedicated database** (`Bookkeeping { database,
+  table }`, default `_chum._chum_migrations`, overridable via
+  `--bookkeeping-database` / `CHUM_BOOKKEEPING_DATABASE` and `--table` /
+  `CHUM_TABLE`). chum runs `CREATE DATABASE IF NOT EXISTS <bookkeeping-database>`
+  (`backend::ensure_database`, called before `ensure_table`) and
+  **fully-qualifies every bookkeeping statement** as `<database>.<table>`.
+  Both identifiers are validated by `backend::validate_ident` (interpolated, not
+  bound). This decoupling is what lets a migration create its **own** database:
+  bookkeeping never depends on any app database existing.
+- **The session default database is never pinned to a possibly-missing app db.**
+  `build_client` calls `with_database` only when `--database` (or the URL
+  path/`database` query param) is explicitly given; otherwise the client stays
+  on the `clickhouse` crate's built-in `default` database (which always exists).
+  ClickHouse rejects any request whose session default database is absent
+  (verified against 25.12), so `--database`, if set, must already exist — it is
+  the session default for *unqualified* names in migration SQL, not where
+  bookkeeping goes. The intended model is that migrations fully-qualify their own
+  object names and leave `--database` unset.
 - **Bookkeeping engine is `MergeTree`** so one DDL works on both single-node and
   `Replicated` ClickHouse (auto-promoted to `ReplicatedMergeTree`).
 - **Append-only state** — each apply writes a `success = false` marker, runs the

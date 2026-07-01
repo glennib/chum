@@ -6,13 +6,17 @@
 #
 # The e2e test is `#[ignore]`d by default, so this is only needed when running
 # `cargo nextest run --run-ignored all`.
+#
+# The HTTP interface is published on host port 8124 (not the ClickHouse default
+# 8123) so it never collides with another project's ClickHouse already bound to
+# 8123. Point the tests at it with `CLICKHOUSE_URL=http://localhost:8124`.
 
 services:
   clickhouse:
-    image: clickhouse/clickhouse-server:25.12
+    image: docker.io/clickhouse/clickhouse-server:25.12
     ports:
-      - "8123:8123"
-      - "9000:9000"
+      - "8124:8123"
+      - "9001:9000"
     volumes:
       - clickhouse-data:/var/lib/clickhouse
     ulimits:

@@ -137,10 +137,11 @@ variables:
 | Flag | Env | Default | Notes |
 |------|-----|---------|-------|
 | `--url` | `CLICKHOUSE_URL` | `http://localhost:8123` | Bare endpoint or full DSN (see below) |
-| `--database` | `CLICKHOUSE_DATABASE` | — | Overrides the database in the URL |
+| `--database` | `CLICKHOUSE_DATABASE` | — | Session default database for **unqualified** names in your migration SQL — *not* where bookkeeping lives (see below). If set, it must already exist. |
 | `--user` | `CLICKHOUSE_USER` | — | Overrides the user in the URL |
 | `--password` | `CLICKHOUSE_PASSWORD` | — | Overrides the password in the URL |
-| `--table` | `CHUM_TABLE` | `_chum_migrations` | |
+| `--table` | `CHUM_TABLE` | `_chum_migrations` | Bookkeeping table name |
+| `--bookkeeping-database` | `CHUM_BOOKKEEPING_DATABASE` | `_chum` | Dedicated database holding the bookkeeping table; chum creates it |
 | `--source` | `CHUM_SOURCE` | `migrations` | Migration directory |
 | `--format` | — | `auto` | `auto` \| `pretty` \| `json` \| `tsv` (`auto` = table on a tty, TSV when piped) |
 | `--json` | — | — | Shorthand for `--format json` |
@@ -151,13 +152,41 @@ variables:
 the HTTP-only `clickhouse` client:
 
 - userinfo, or `user` / `username` / `password` query params → credentials;
-- the first path segment, or a `database` / `db` query param → database;
+- the first path segment, or a `database` / `db` query param → the **session
+  default database** (see below);
 - a scheme containing `https`, or a truthy `secure` query param → TLS;
 - `x-*` query params (golang-migrate driver params) are ignored;
 - any other query param becomes a ClickHouse setting.
 
 `--user` / `--password` / `--database` override whatever the URL provides. Set
 `RUST_LOG` to control log verbosity (default `info`).
+
+### `--database` vs `--bookkeeping-database`
+
+These are two different things, and keeping them separate is what lets a
+migration bootstrap its own database:
+
+- **`--bookkeeping-database`** (default `_chum`) is chum's own — it holds the
+  bookkeeping table. chum runs `CREATE DATABASE IF NOT EXISTS` for it and
+  fully-qualifies every bookkeeping statement as
+  `<bookkeeping-database>.<table>`, so bookkeeping **never depends on any app
+  database existing**.
+- **`--database`** is the *session default* for **unqualified** object names in
+  your migration SQL. It is **not** where bookkeeping goes. By default it is
+  left unset, and chum connects on ClickHouse's built-in `default` database
+  (which always exists) rather than pinning a possibly-missing app database.
+  This is deliberate: it lets a migration create and fully-qualify its own
+  database, e.g.
+
+  ```sql
+  CREATE DATABASE app;
+  CREATE TABLE app.events (…) ENGINE = MergeTree ORDER BY …;
+  ```
+
+  with no `--database` and no database pre-created. Set `--database` only if
+  your migrations rely on unqualified names against an existing session default
+  — in which case that database **must already exist**, because ClickHouse
+  rejects any request whose session default database is absent.
 
 ## Library
 
@@ -173,26 +202,44 @@ chum = { version = "0.1.0", default-features = false }
 Embed migrations at compile time and drive the `Migrator`:
 
 ```rust,no_run
-use chum::{Migrator, source};
+use chum::{Bookkeeping, Migrator, source};
 use include_dir::{include_dir, Dir};
 
 static MIGRATIONS: Dir = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 # async fn run() -> chum::Result<()> {
 let migrator = Migrator::new(source::from_dir(&MIGRATIONS)?);
+// No app database pinned as the session default, so migrations can create and
+// fully-qualify their own databases.
 let client = clickhouse::Client::default()
-    .with_url("http://localhost:8123")
-    .with_database("mydb");
-migrator.run(&client, chum::DEFAULT_TABLE, None).await?;
+    .with_url("http://localhost:8123");
+// Bookkeeping lives in its own database (default `_chum`), fully-qualified as
+// `_chum._chum_migrations`.
+let bookkeeping = Bookkeeping::new(chum::DEFAULT_BOOKKEEPING_DATABASE, chum::DEFAULT_TABLE)?;
+migrator.run(&client, &bookkeeping, None).await?;
 # Ok(())
 # }
 ```
 
+The migrator takes a [`Bookkeeping`] target (database + table). It runs
+`CREATE DATABASE IF NOT EXISTS` for the bookkeeping database and fully-qualifies
+all bookkeeping SQL, so it never needs an app database to exist.
+
 ## How state is tracked
 
 `chum` records applied migrations in a bookkeeping table (default
-`_chum_migrations`), engine **`MergeTree`**. The engine is chosen so one DDL
-works everywhere: on a managed/`Replicated` ClickHouse, `MergeTree` is
+`_chum_migrations`) that lives in its **own dedicated database** (default
+`_chum`, override with `--bookkeeping-database`). chum creates that database
+(`CREATE DATABASE IF NOT EXISTS`) and fully-qualifies every bookkeeping
+statement as `<bookkeeping-database>.<table>`. Keeping bookkeeping in its own
+database — rather than in the connection's default database — means chum never
+depends on any app database existing, so a migration is free to create its own
+database (`CREATE DATABASE app; CREATE TABLE app.t …`) as its first step. See
+[`--database` vs `--bookkeeping-database`](#--database-vs---bookkeeping-database)
+above.
+
+The bookkeeping table's engine is **`MergeTree`**. The engine is chosen so one
+DDL works everywhere: on a managed/`Replicated` ClickHouse, `MergeTree` is
 auto-promoted to `ReplicatedMergeTree`, giving consistent bookkeeping across
 replicas — whereas the log-family engines a tiny table would suggest (e.g.
 golang-migrate's `TinyLog`) are non-replicated and rejected by a `Replicated`
@@ -236,10 +283,21 @@ Unit tests (statement splitter, filename parsing) run with no infrastructure —
 `mise run test` (or `cargo nextest run`). The end-to-end test against a live
 ClickHouse is `#[ignore]`d by default:
 
+The compose file publishes ClickHouse on host port **8124** (not the default
+8123) so it never collides with another project's ClickHouse. The e2e tests
+default `CLICKHOUSE_URL` to `http://localhost:8124`.
+
 ```bash
-mise run db:up                                                # start ClickHouse (podman, falls back to docker)
-cargo nextest run --run-ignored all -E 'test(full_lifecycle)' # run it
+mise run db:up                                                # start ClickHouse on :8124 (podman, falls back to docker)
+cargo nextest run --run-ignored all                           # run every e2e test
+cargo nextest run --run-ignored all -E 'test(full_lifecycle)' # or just one
 mise run db:down                                              # stop it
 ```
+
+The e2e suite proves the dedicated-bookkeeping-database model end to end: chum
+creates `_chum`, applies a migration that itself runs
+`CREATE DATABASE …; CREATE TABLE ….t …` without the app database pre-existing,
+records bookkeeping in `_chum._chum_migrations`, re-runs idempotently, honors a
+`--bookkeeping-database` override, and reverts cleanly.
 
 [`sqlparser`]: https://crates.io/crates/sqlparser
