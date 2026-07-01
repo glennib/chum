@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/glennib/chum/compare/v0.1.1...v0.2.0) - 2026-07-01
+
+### Added
+
+- [**breaking**] stop reading connection config from CLICKHOUSE_* env vars
+- [**breaking**] store migration bookkeeping in a dedicated _chum database
+
+### Other
+
+- drop clap-parse-only tests that restate library behavior
+- drop env-mutating test, remove all unsafe from the crate
+- *(deps)* update actions/checkout action to v7
+- *(deps)* update actions/cache action to v6
+
 ## [0.1.1](https://github.com/glennib/chum/compare/v0.1.0...v0.1.1) - 2026-06-29
 
 ### Added
