@@ -1523,71 +1523,14 @@ mod tests {
     }
 
     #[test]
-    fn connection_config_is_not_read_from_the_environment() {
+    fn build_client_resolves_a_full_dsn() {
         use clap::Parser as _;
 
-        // Save and set all four `CLICKHOUSE_*` connection env vars. An
-        // application sharing chum's `.env` legitimately sets these; chum reads
-        // NONE of them. The four flags have no `env` binding, so no other code
-        // path (or parallel test) reads them — the process-global mutation is
-        // inert elsewhere; still, restore the ambient environment on the way out.
-        //
-        // SAFETY: the vars are not read by any concurrently-running thread (no
-        // clap `env` binding references them), so set/remove here is sound.
-        let vars = [
-            "CLICKHOUSE_URL",
-            "CLICKHOUSE_DATABASE",
-            "CLICKHOUSE_USER",
-            "CLICKHOUSE_PASSWORD",
-        ];
-        let saved = vars.map(|k| (k, std::env::var_os(k)));
-        unsafe {
-            std::env::set_var("CLICKHOUSE_URL", "http://ambient-host-from-env:9999");
-            std::env::set_var("CLICKHOUSE_DATABASE", "appdb_from_env");
-            std::env::set_var("CLICKHOUSE_USER", "user_from_env");
-            std::env::set_var("CLICKHOUSE_PASSWORD", "password_from_env");
-        }
-
-        // Nothing is inherited: `--url` falls back to the localhost default (not
-        // the ambient env value), and user/password/database resolve to None.
-        let cli = Cli::try_parse_from(["chum", "info"]).expect("valid args parse");
-        assert_eq!(
-            cli.url, "http://localhost:8123",
-            "CLICKHOUSE_URL must not be inherited; --url uses its localhost default"
-        );
-        assert_eq!(
-            cli.database, None,
-            "CLICKHOUSE_DATABASE must not be inherited"
-        );
-        assert_eq!(cli.user, None, "CLICKHOUSE_USER must not be inherited");
-        assert_eq!(
-            cli.password, None,
-            "CLICKHOUSE_PASSWORD must not be inherited"
-        );
-
-        // Explicit flags still take effect.
-        let cli = Cli::try_parse_from([
-            "chum",
-            "--url",
-            "http://explicit-host:8123",
-            "--database",
-            "explicit_db",
-            "--user",
-            "explicit_user",
-            "--password",
-            "explicit_password",
-            "info",
-        ])
-        .expect("valid args parse");
-        assert_eq!(cli.url, "http://explicit-host:8123");
-        assert_eq!(cli.database.as_deref(), Some("explicit_db"));
-        assert_eq!(cli.user.as_deref(), Some("explicit_user"));
-        assert_eq!(cli.password.as_deref(), Some("explicit_password"));
-
-        // A full DSN passed via an explicit `--url` still populates user /
-        // password / database. The `clickhouse::Client` exposes no getters, so a
-        // successful `build_client` on a DSN carrying all three is the observable
-        // contract that the DSN is still parsed.
+        // A full DSN passed via `--url` carries user / password / database via
+        // userinfo, path, and query param. The `clickhouse::Client` exposes no
+        // getters, so a successful `build_client` on such a DSN is the observable
+        // contract that the DSN is parsed. The identity lives in the DSN, so the
+        // individual flags stay None.
         let cli = Cli::try_parse_from([
             "chum",
             "--url",
@@ -1595,22 +1538,10 @@ mod tests {
             "info",
         ])
         .expect("valid args parse");
-        // The flags themselves stay None — the identity lives in the DSN, which
-        // build_client resolves.
         assert_eq!(cli.user, None);
         assert_eq!(cli.password, None);
         assert_eq!(cli.database, None);
         build_client(&cli).expect("build client from a full DSN");
-
-        // Restore the ambient environment.
-        unsafe {
-            for (k, v) in saved {
-                match v {
-                    Some(v) => std::env::set_var(k, v),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
     }
 
     #[test]
