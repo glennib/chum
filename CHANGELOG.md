@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/glennib/chum/compare/v0.2.0...v0.2.1) - 2026-07-27
+
+### Other
+
+- *(deps)* lock file maintenance ([#28](https://github.com/glennib/chum/pull/28))
+- *(deps)* update dependency cargo-binstall to v1.21.1 ([#27](https://github.com/glennib/chum/pull/27))
+- *(deps)* update rust crate tokio to v1.53.1 ([#26](https://github.com/glennib/chum/pull/26))
+- *(deps)* update rust crate serde_json to v1.0.151 ([#25](https://github.com/glennib/chum/pull/25))
+- *(deps)* update rust crate clap to v4.6.3 ([#24](https://github.com/glennib/chum/pull/24))
+- *(deps)* update rust crate thiserror to v2.0.19 ([#23](https://github.com/glennib/chum/pull/23))
+- *(deps)* update rust crate serde to v1.0.229 ([#22](https://github.com/glennib/chum/pull/22))
+- *(deps)* update rust crate tokio to v1.53.0 ([#21](https://github.com/glennib/chum/pull/21))
+- *(deps)* update rust crate tokio to v1.52.4 ([#20](https://github.com/glennib/chum/pull/20))
+- *(deps)* update rust crate clap to v4.6.2 ([#19](https://github.com/glennib/chum/pull/19))
+- *(deps)* update dependency cargo-binstall to v1.21.0 ([#18](https://github.com/glennib/chum/pull/18))
+
 ## [0.2.0](https://github.com/glennib/chum/compare/v0.1.1...v0.2.0) - 2026-07-01
 
 ### Added
