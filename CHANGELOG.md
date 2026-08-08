@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/glennib/chum/compare/v0.2.1...v0.2.2) - 2026-08-04
+
+### Other
+
+- *(deps)* update dependency cargo:cargo-nextest to v0.9.143 ([#35](https://github.com/glennib/chum/pull/35))
+- *(deps)* lock file maintenance ([#34](https://github.com/glennib/chum/pull/34))
+- *(deps)* update rust crate clap to v4.6.5 ([#33](https://github.com/glennib/chum/pull/33))
+- *(deps)* update dependency cargo:release-plz to v0.3.160 ([#32](https://github.com/glennib/chum/pull/32))
+- *(deps)* update dependency cargo:cargo-nextest to v0.9.140 ([#30](https://github.com/glennib/chum/pull/30))
+- *(deps)* update dependency cargo:cargo-edit to v0.13.13 ([#29](https://github.com/glennib/chum/pull/29))
+
 ## [0.2.1](https://github.com/glennib/chum/compare/v0.2.0...v0.2.1) - 2026-07-27
 
 ### Other
