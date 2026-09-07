@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3](https://github.com/glennib/chum/compare/v0.2.2...v0.2.3) - 2026-09-07
+
+### Fixed
+
+- *(deps)* update rust crate tabled to 0.22 ([#46](https://github.com/glennib/chum/pull/46))
+
+### Other
+
+- *(deps)* lock file maintenance ([#49](https://github.com/glennib/chum/pull/49))
+- *(deps)* update dependency cargo:release-plz to v0.3.162 ([#47](https://github.com/glennib/chum/pull/47))
+- *(deps)* update dependency cargo-binstall to v1.23.0 ([#48](https://github.com/glennib/chum/pull/48))
+- *(deps)* update dependency cargo:release-plz to v0.3.161 ([#45](https://github.com/glennib/chum/pull/45))
+- *(deps)* lock file maintenance ([#44](https://github.com/glennib/chum/pull/44))
+- *(deps)* update rust crate clickhouse to v0.15.2 ([#43](https://github.com/glennib/chum/pull/43))
+- *(deps)* lock file maintenance ([#42](https://github.com/glennib/chum/pull/42))
+- *(deps)* update dependency cargo-binstall to v1.22.0 ([#41](https://github.com/glennib/chum/pull/41))
+
 ## [0.2.2](https://github.com/glennib/chum/compare/v0.2.1...v0.2.2) - 2026-08-04
 
 ### Other
