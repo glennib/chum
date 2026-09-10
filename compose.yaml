@@ -13,7 +13,7 @@
 
 services:
   clickhouse:
-    image: docker.io/clickhouse/clickhouse-server:25.12
+    image: docker.io/clickhouse/clickhouse-server:26.8
     ports:
       - "8124:8123"
       - "9001:9000"
