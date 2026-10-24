@@ -3,7 +3,7 @@ cargo-binstall = "1.26.1"
 "cargo:cargo-dist" = "0.32.0"
 "cargo:cargo-edit" = "0.13.14"
 "cargo:cargo-nextest" = "0.9.149"
-"cargo:release-plz" = "0.4.0"
+"cargo:release-plz" = "0.4.1"
 
 [tasks.fmt]
 description = "Format code"
