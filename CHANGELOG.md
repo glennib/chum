@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4](https://github.com/glennib/chum/compare/v0.2.3...v0.2.4) - 2026-10-27
+
+### Other
+
+- *(deps)* update dependency cargo:release-plz to v0.4.2 ([#97](https://github.com/glennib/chum/pull/97))
+- *(deps)* update dependency cargo:cargo-nextest to v0.9.150 ([#96](https://github.com/glennib/chum/pull/96))
+- *(deps)* lock file maintenance ([#95](https://github.com/glennib/chum/pull/95))
+- *(deps)* update dependency cargo:release-plz to v0.4.1 ([#94](https://github.com/glennib/chum/pull/94))
+- *(deps)* update dependency cargo-binstall to v1.26.1 ([#93](https://github.com/glennib/chum/pull/93))
+- *(deps)* update dependency cargo:release-plz to v0.4.0 ([#92](https://github.com/glennib/chum/pull/92))
+- *(deps)* update dependency cargo:cargo-edit to v0.13.14 ([#90](https://github.com/glennib/chum/pull/90))
+- *(deps)* update rust crate tokio to v1.54.1 ([#91](https://github.com/glennib/chum/pull/91))
+- *(deps)* update dependency cargo:release-plz to v0.3.174 ([#89](https://github.com/glennib/chum/pull/89))
+- *(deps)* update dependency cargo:cargo-nextest to v0.9.149 ([#88](https://github.com/glennib/chum/pull/88))
+- *(deps)* update dependency cargo:release-plz to v0.3.173 ([#86](https://github.com/glennib/chum/pull/86))
+- *(deps)* update rust crate tokio to v1.54.0 ([#87](https://github.com/glennib/chum/pull/87))
+- *(deps)* lock file maintenance ([#85](https://github.com/glennib/chum/pull/85))
+- *(deps)* update dependency cargo-binstall to v1.26.0 ([#84](https://github.com/glennib/chum/pull/84))
+- *(deps)* update rust crate tokio to v1.53.3 ([#83](https://github.com/glennib/chum/pull/83))
+- *(deps)* update rust crate clickhouse to v0.15.3 ([#82](https://github.com/glennib/chum/pull/82))
+- *(deps)* update rust crate sha2 to v0.11.1 ([#81](https://github.com/glennib/chum/pull/81))
+- *(deps)* update dependency cargo:release-plz to v0.3.172 ([#80](https://github.com/glennib/chum/pull/80))
+- *(deps)* lock file maintenance ([#79](https://github.com/glennib/chum/pull/79))
+- *(deps)* update rust crate serde_json to v1.0.154 ([#78](https://github.com/glennib/chum/pull/78))
+- *(deps)* update rust crate serde_json to v1.0.152 ([#77](https://github.com/glennib/chum/pull/77))
+- *(deps)* update dependency cargo-binstall to v1.25.3 ([#76](https://github.com/glennib/chum/pull/76))
+- *(deps)* update dependency cargo:release-plz to v0.3.171 ([#75](https://github.com/glennib/chum/pull/75))
+- *(deps)* update dependency cargo:cargo-nextest to v0.9.148 ([#74](https://github.com/glennib/chum/pull/74))
+- *(deps)* update dependency cargo:release-plz to v0.3.170 ([#73](https://github.com/glennib/chum/pull/73))
+- *(deps)* update dependency cargo-binstall to v1.25.2 ([#72](https://github.com/glennib/chum/pull/72))
+- *(deps)* lock file maintenance ([#71](https://github.com/glennib/chum/pull/71))
+- *(deps)* update rust crate tokio to v1.53.2 ([#70](https://github.com/glennib/chum/pull/70))
+- *(deps)* update dependency cargo-binstall to v1.25.1 ([#69](https://github.com/glennib/chum/pull/69))
+- *(deps)* update dependency cargo-binstall to v1.25.0 ([#68](https://github.com/glennib/chum/pull/68))
+- *(deps)* lock file maintenance ([#67](https://github.com/glennib/chum/pull/67))
+- *(deps)* update dependency cargo-binstall to v1.24.0 ([#66](https://github.com/glennib/chum/pull/66))
+- *(deps)* update rust crate thiserror to v2.0.21 ([#65](https://github.com/glennib/chum/pull/65))
+- *(deps)* update dependency cargo:cargo-nextest to v0.9.146 ([#64](https://github.com/glennib/chum/pull/64))
+- *(deps)* lock file maintenance ([#63](https://github.com/glennib/chum/pull/63))
+- *(deps)* update dependency cargo:release-plz to v0.3.169 ([#61](https://github.com/glennib/chum/pull/61))
+
 ## [0.2.3](https://github.com/glennib/chum/compare/v0.2.2...v0.2.3) - 2026-09-17
 
 ### Fixed
