@@ -13,14 +13,6 @@ run = "cargo fmt --all"
 description = "Check code formatting"
 run = "cargo fmt --all -- --check"
 
-[tasks."fmt:nightly"]
-description = "Format code with nightly"
-run = "cargo +nightly fmt --all"
-
-[tasks."fmt:check:nightly"]
-description = "Check code formatting with nightly"
-run = "cargo +nightly fmt --all -- --check"
-
 [tasks.clippy]
 description = "Run clippy lints (all features)"
 run = "cargo clippy --all-targets --all-features -- -D warnings"

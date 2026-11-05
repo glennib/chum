@@ -90,10 +90,9 @@ tests/
 
 ### Formatting
 
-- `rustfmt.toml` uses nightly-only options (`format_strings`, `group_imports`,
-  `imports_granularity`, `wrap_comments`, `doc_comment_code_block_width`).
-- Run `mise run fmt:nightly` (or `cargo +nightly fmt --all`) for full
-  formatting locally. **Always run it before committing.**
+- Formatting uses stable rustfmt; `rustfmt.toml` holds only stable options.
+- Run `mise run fmt` (or `cargo fmt --all`) before committing; CI checks it
+  with `mise run fmt:check`.
 
 ### Error handling
 
