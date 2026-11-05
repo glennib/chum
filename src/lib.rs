@@ -7,6 +7,14 @@
 //! cannot be fully parsed into an AST, but statement boundaries can be found
 //! robustly — see [`split`]).
 //!
+//! With the `template` feature, a file ending in `.sql.j2` is a [minijinja]
+//! template, rendered before it runs with the variables given to
+//! [`Migrator::vars`]: `env.<name>` for values describing the target
+//! environment, and `this.<name>` for values meant for one version. The values
+//! each migration used are recorded in the bookkeeping table.
+//!
+//! [minijinja]: https://docs.rs/minijinja
+//!
 //! # Library usage
 //!
 //! Build a [`Migrator`] from a source and drive it against a client. This
@@ -56,6 +64,9 @@ pub mod migration;
 pub mod migrator;
 pub mod source;
 pub mod split;
+#[cfg(feature = "template")]
+mod template;
+pub mod vars;
 
 /// The default name of the bookkeeping table recording applied migrations.
 pub const DEFAULT_TABLE: &str = "_chum_migrations";
@@ -70,6 +81,7 @@ pub const DEFAULT_BOOKKEEPING_DATABASE: &str = "_chum";
 
 pub use backend::Bookkeeping;
 pub use error::ChumError;
+pub use error::RenderFailure;
 pub use error::Result;
 pub use migration::AppliedMigration;
 pub use migration::Direction;
@@ -80,3 +92,9 @@ pub use migrator::Planned;
 pub use migrator::Progress;
 pub use migrator::State;
 pub use migrator::Status;
+pub use migrator::UsedVar;
+pub use migrator::VarNotice;
+pub use vars::Origin;
+pub use vars::Supplied;
+pub use vars::VarKey;
+pub use vars::Vars;

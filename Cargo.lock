@@ -289,6 +289,7 @@ dependencies = [
  "include_dir",
  "indicatif",
  "miette",
+ "minijinja",
  "percent-encoding",
  "serde",
  "serde_json",
@@ -1096,6 +1097,12 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "minijinja"
+version = "3.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00f5a04892e86ddb4fc254e9160835370b63a0d44042d3ab4725bc2dbcbab136"
 
 [[package]]
 name = "minimal-lexical"

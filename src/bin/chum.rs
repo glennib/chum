@@ -522,7 +522,7 @@ async fn run(cli: Cli) -> miette::Result<()> {
     // `add` and `convert` are purely local and need no database connection.
     if let Command::Add { name, sequential } = &cli.command {
         let version = next_version(&cli.source, *sequential)?;
-        let (up, down) = source::scaffold(&cli.source, &version, name)?;
+        let (up, down) = source::scaffold(&cli.source, &version, name, false)?;
         return render_add(&up, &down, fmt);
     }
     if let Command::Convert { to, dry_run } = &cli.command {
@@ -1296,7 +1296,7 @@ fn run_convert(dir: &Path, to: Scheme, dry_run: bool, fmt: Resolved) -> miette::
     let mut plan: Vec<(PathBuf, PathBuf)> = Vec::new();
     for f in &files {
         let prefix = &map[&f.version];
-        let target = dir.join(format!("{prefix}_{}{}", f.name, f.direction.suffix()));
+        let target = dir.join(format!("{prefix}_{}{}", f.name, f.suffix()));
         if target != f.path {
             plan.push((f.path.clone(), target));
         }

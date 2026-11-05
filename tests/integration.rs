@@ -475,6 +475,264 @@ async fn writing_commands_add_the_vars_column_to_an_old_table() {
     exec(&admin, &format!("DROP DATABASE IF EXISTS {bookkeeping_db}")).await;
 }
 
+/// Templated migrations whose database names come from `env.db` and
+/// `env.log`, so each test can use its own databases.
+#[cfg(feature = "template")]
+static TEMPLATE_MIGRATIONS: Dir = include_dir!("$CARGO_MANIFEST_DIR/tests/template_migrations");
+
+/// A fresh bookkeeping database and log database (with a `reverted` table the
+/// fixture's down migration writes to), and no app database.
+#[cfg(feature = "template")]
+async fn template_setup(
+    admin: &clickhouse::Client,
+    bookkeeping_db: &str,
+    app_db: &str,
+    log_db: &str,
+) {
+    for db in [app_db, bookkeeping_db, log_db] {
+        exec(admin, &format!("DROP DATABASE IF EXISTS {db}")).await;
+    }
+    exec(admin, &format!("CREATE DATABASE {log_db}")).await;
+    exec(
+        admin,
+        &format!(
+            "CREATE TABLE {log_db}.reverted (cutoff String) ENGINE = MergeTree ORDER BY cutoff"
+        ),
+    )
+    .await;
+}
+
+#[cfg(feature = "template")]
+async fn template_teardown(admin: &clickhouse::Client, dbs: &[&str]) {
+    for db in dbs {
+        exec(admin, &format!("DROP DATABASE IF EXISTS {db}")).await;
+    }
+}
+
+#[cfg(feature = "template")]
+fn template_migrator(vars: chum::Vars) -> Migrator {
+    Migrator::new(source::from_dir(&TEMPLATE_MIGRATIONS).expect("embedded migrations")).vars(vars)
+}
+
+#[cfg(feature = "template")]
+async fn bookkeeping_rows(admin: &clickhouse::Client, bookkeeping_db: &str) -> u64 {
+    admin
+        .query(&format!("SELECT count() FROM {bookkeeping_db}.{TABLE}"))
+        .fetch_one()
+        .await
+        .expect("count bookkeeping")
+}
+
+/// Apply templates, read their recorded variables back from `info` and with
+/// the SQL documented for jobs outside chum, then revert with no variables
+/// supplied: the down templates render from the recorded values, including a
+/// value only a down migration uses.
+#[cfg(feature = "template")]
+#[tokio::test]
+#[ignore = "requires a running ClickHouse (mise run db:up)"]
+async fn templates_record_their_variables_and_revert_from_them() {
+    use std::collections::BTreeMap;
+
+    let admin = client("default");
+    let (bookkeeping_db, app_db, log_db) = ("chum_it_tpl_bk", "chum_it_tpl_app", "chum_it_tpl_log");
+    template_setup(&admin, bookkeeping_db, app_db, log_db).await;
+    let db = unpinned_client();
+    let bookkeeping = Bookkeeping::new(bookkeeping_db, TABLE).expect("valid bookkeeping");
+    let cutoff = "2026-11-10 09:00:00";
+
+    let migrator = template_migrator(
+        chum::Vars::new()
+            .with_env("db", app_db)
+            .with_env("log", log_db)
+            .with_env("tier", "prod")
+            .with_this(2, "cutoff", cutoff),
+    );
+    // The pending templates list what they refer to.
+    let statuses = migrator.info(&db, &bookkeeping).await.expect("info");
+    assert!(statuses[1].template_vars.contains("this.cutoff"));
+
+    let applied = migrator.run(&db, &bookkeeping, None).await.expect("run");
+    assert_eq!(applied.len(), 2);
+    assert_eq!(
+        table_count(&admin, app_db).await,
+        3,
+        "events, prod_only, cutoffs"
+    );
+
+    let expected = |items: &[(&str, &str)]| -> BTreeMap<String, String> {
+        items
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    };
+    let statuses = migrator.info(&db, &bookkeeping).await.expect("info");
+    assert_eq!(
+        statuses[0].vars,
+        expected(&[("env.db", app_db), ("env.tier", "prod")])
+    );
+    // `env.log` is recorded because the down migration uses it.
+    assert_eq!(
+        statuses[1].vars,
+        expected(&[
+            ("env.db", app_db),
+            ("env.log", log_db),
+            ("this.cutoff", cutoff)
+        ])
+    );
+    assert!(statuses[1].template_vars.is_empty(), "applied");
+
+    let recorded: Vec<String> = admin
+        .query(&format!(
+            "SELECT argMax(vars, seq)['this.cutoff'] AS cutoff
+             FROM {bookkeeping_db}.{TABLE}
+             WHERE version = 2
+             GROUP BY version
+             HAVING argMax(success, seq) AND mapContains(argMax(vars, seq), 'this.cutoff')"
+        ))
+        .fetch_all()
+        .await
+        .expect("documented query");
+    assert_eq!(recorded, [cutoff]);
+
+    // A supplied `this.*` value that differs from the recorded one is refused.
+    let conflicting = template_migrator(chum::Vars::new().with_this(2, "cutoff", "other"));
+    let err = conflicting
+        .revert_plan(&db, &bookkeeping, i64::MIN)
+        .await
+        .expect_err("conflict");
+    assert!(
+        matches!(err, chum::ChumError::VarConflict { version: 2, .. }),
+        "{err}"
+    );
+
+    let bare = template_migrator(chum::Vars::new());
+    let reverted = bare.undo(&db, &bookkeeping, i64::MIN).await.expect("undo");
+    assert_eq!(reverted, [2, 1]);
+    assert!(
+        !database_exists(&admin, app_db).await,
+        "reverted from recorded env.db"
+    );
+    let logged: Vec<String> = admin
+        .query(&format!("SELECT cutoff FROM {log_db}.reverted"))
+        .fetch_all()
+        .await
+        .expect("read log");
+    assert_eq!(logged, [cutoff], "the down rendered the recorded cutoff");
+    assert_eq!(bookkeeping_rows(&admin, bookkeeping_db).await, 0);
+
+    template_teardown(&admin, &[app_db, bookkeeping_db, log_db]).await;
+}
+
+/// A variable missing from the last pending migration aborts the run before
+/// the first migration runs and before any marker is written.
+#[cfg(feature = "template")]
+#[tokio::test]
+#[ignore = "requires a running ClickHouse (mise run db:up)"]
+async fn a_missing_variable_aborts_before_anything_runs() {
+    let admin = client("default");
+    let (bookkeeping_db, app_db, log_db) = (
+        "chum_it_tpl_missing_bk",
+        "chum_it_tpl_missing_app",
+        "chum_it_tpl_missing_log",
+    );
+    template_setup(&admin, bookkeeping_db, app_db, log_db).await;
+    let db = unpinned_client();
+    let bookkeeping = Bookkeeping::new(bookkeeping_db, TABLE).expect("valid bookkeeping");
+
+    let migrator = template_migrator(
+        chum::Vars::new()
+            .with_env("db", app_db)
+            .with_env("tier", "local"),
+    );
+    let err = migrator
+        .run(&db, &bookkeeping, None)
+        .await
+        .expect_err("missing cutoff");
+    let chum::ChumError::Render(failures) = &err else {
+        panic!("expected a render error, got {err}");
+    };
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].version, 2);
+    assert_eq!(failures[0].missing, ["this.cutoff"]);
+    assert!(
+        !database_exists(&admin, app_db).await,
+        "migration 1 did not run"
+    );
+    assert_eq!(
+        bookkeeping_rows(&admin, bookkeeping_db).await,
+        0,
+        "no markers"
+    );
+
+    // `--target` applies the part that can render.
+    migrator
+        .run(&db, &bookkeeping, Some(1))
+        .await
+        .expect("run to 1");
+    assert!(database_exists(&admin, app_db).await);
+
+    template_teardown(&admin, &[app_db, bookkeeping_db, log_db]).await;
+}
+
+/// A guard that rejects its input leaves the version dirty with its variables
+/// recorded; `force` refuses a different value for a recorded `this.*`, and
+/// `reset` makes the version pending so a corrected run applies it.
+#[cfg(feature = "template")]
+#[tokio::test]
+#[ignore = "requires a running ClickHouse (mise run db:up)"]
+async fn a_failed_guard_is_cleared_with_reset() {
+    let admin = client("default");
+    let (bookkeeping_db, app_db, log_db) = (
+        "chum_it_tpl_guard_bk",
+        "chum_it_tpl_guard_app",
+        "chum_it_tpl_guard_log",
+    );
+    template_setup(&admin, bookkeeping_db, app_db, log_db).await;
+    let db = unpinned_client();
+    let bookkeeping = Bookkeeping::new(bookkeeping_db, TABLE).expect("valid bookkeeping");
+    let base = chum::Vars::new()
+        .with_env("db", app_db)
+        .with_env("tier", "local");
+
+    let migrator = template_migrator(base.clone().with_this(2, "cutoff", "bad"));
+    let err = migrator
+        .run(&db, &bookkeeping, None)
+        .await
+        .expect_err("guard");
+    assert!(err.to_string().contains("cutoff rejected"), "{err}");
+    let statuses = migrator.info(&db, &bookkeeping).await.expect("info");
+    assert_eq!(statuses[0].state, State::Applied);
+    assert_eq!(statuses[1].state, State::Dirty);
+    assert_eq!(statuses[1].vars["this.cutoff"], "bad");
+
+    let err = template_migrator(base.clone().with_this(2, "cutoff", "good"))
+        .force(&db, &bookkeeping, 2)
+        .await
+        .expect_err("conflict with the recorded value");
+    assert!(matches!(err, chum::ChumError::VarConflict { .. }), "{err}");
+
+    for (version, state) in [(1, State::Applied), (3, State::Pending)] {
+        let err = migrator
+            .reset(&db, &bookkeeping, version)
+            .await
+            .expect_err("not dirty");
+        assert!(
+            matches!(err, chum::ChumError::NotDirty { state: s, .. } if s == state),
+            "{err}"
+        );
+    }
+    migrator.reset(&db, &bookkeeping, 2).await.expect("reset");
+    let statuses = migrator.info(&db, &bookkeeping).await.expect("info");
+    assert_eq!(statuses[1].state, State::Pending);
+
+    let fixed = template_migrator(base.with_this(2, "cutoff", "good"));
+    let applied = fixed.run(&db, &bookkeeping, None).await.expect("run");
+    assert_eq!(applied.len(), 1);
+    assert_eq!(applied[0].vars["this.cutoff"], "good");
+
+    template_teardown(&admin, &[app_db, bookkeeping_db, log_db]).await;
+}
+
 /// `max_version` scans filenames only (no ClickHouse), so this runs in the
 /// default test flow. It exercises the seam the `add` command uses to continue
 /// a sequential scheme: a missing dir, an empty dir, and the highest version

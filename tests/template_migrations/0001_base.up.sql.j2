@@ -1,0 +1,12 @@
+CREATE DATABASE {{ env.db | sql_ident }};
+
+CREATE TABLE {{ env.db | sql_ident }}.events
+(
+    ts DateTime
+)
+ENGINE = MergeTree
+ORDER BY ts;
+
+{% if env.tier == "prod" %}
+CREATE TABLE {{ env.db | sql_ident }}.prod_only (x UInt8) ENGINE = MergeTree ORDER BY x;
+{% endif %}

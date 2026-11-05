@@ -17,6 +17,15 @@ pub enum Direction {
 }
 
 impl Direction {
+    /// `"up"` or `"down"`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Direction::Up => "up",
+            Direction::Down => "down",
+        }
+    }
+
     /// The filename suffix this direction is recorded with.
     #[must_use]
     pub fn suffix(self) -> &'static str {
@@ -43,17 +52,26 @@ pub struct Migration {
     pub description: Cow<'static, str>,
     /// Whether this is an up or down migration.
     pub direction: Direction,
-    /// The raw SQL contents of the migration file.
+    /// The raw contents of the migration file: SQL, or for a template the
+    /// template text.
     pub sql: Cow<'static, str>,
     /// Hex-encoded SHA-384 digest of [`Migration::sql`], used to detect
     /// changes to a migration that has already been applied. Computed over a
     /// lightly normalized form of the SQL (see [`checksum`]) so that line
-    /// endings and trailing whitespace don't trip false drift.
+    /// endings and trailing whitespace don't trip false drift. For a template
+    /// it covers the template text, so every environment records the same
+    /// checksum whatever it rendered.
     pub checksum: Cow<'static, str>,
+    /// Whether the file is a `.sql.j2` template, rendered with the supplied
+    /// variables before it runs.
+    pub template: bool,
+    /// The file name, used in render errors and `chum render` headers.
+    pub file_name: Cow<'static, str>,
 }
 
 impl Migration {
-    /// Construct a migration, computing its checksum from the SQL.
+    /// Construct a plain migration, computing its checksum from the SQL. Its
+    /// file name is derived from the version, description and direction.
     #[must_use]
     pub fn new(
         version: i64,
@@ -62,16 +80,52 @@ impl Migration {
         sql: impl Into<Cow<'static, str>>,
     ) -> Self {
         let sql = sql.into();
+        let description = description.into();
         let checksum = Cow::Owned(checksum(&sql));
+        let file_name = Cow::Owned(format!(
+            "{version}_{}{}",
+            description.replace(' ', "_"),
+            direction.suffix()
+        ));
         Self {
             version,
-            description: description.into(),
+            description,
             direction,
             sql,
             checksum,
+            template: false,
+            file_name,
         }
     }
+
+    /// Mark the migration as a template (or not), adjusting a derived file
+    /// name's suffix to match.
+    #[must_use]
+    pub fn with_template(mut self, template: bool) -> Self {
+        if template && !self.template {
+            self.file_name = Cow::Owned(format!("{}{TEMPLATE_SUFFIX}", self.file_name));
+        } else if !template && self.template {
+            self.file_name = Cow::Owned(
+                self.file_name
+                    .strip_suffix(TEMPLATE_SUFFIX)
+                    .unwrap_or(&self.file_name)
+                    .to_owned(),
+            );
+        }
+        self.template = template;
+        self
+    }
+
+    /// Set the file name shown in messages.
+    #[must_use]
+    pub fn with_file_name(mut self, file_name: impl Into<Cow<'static, str>>) -> Self {
+        self.file_name = file_name.into();
+        self
+    }
 }
+
+/// The extra suffix that marks a migration file as a template.
+pub const TEMPLATE_SUFFIX: &str = ".j2";
 
 /// A migration that has been recorded in the database bookkeeping table.
 ///
@@ -159,6 +213,27 @@ mod tests {
             checksum("CREATE TABLE t (a UInt8) ENGINE = Memory"),
             checksum("CREATE TABLE t (a UInt16) ENGINE = Memory"),
         );
+    }
+
+    #[test]
+    fn plain_checksum_is_unchanged() {
+        // Recorded checksums of applied migrations must stay valid: this is the
+        // plain SHA-384 of the normalized text.
+        assert_eq!(
+            checksum("CREATE TABLE t (a UInt8) ENGINE = Memory\r\n"),
+            "a25d2f02a48904786482d430d6602ee07d6a9b2cb3f9a605b2f5c9265cfa3aa5914e621a410f21af82804d6\
+             22af19676"
+        );
+    }
+
+    #[test]
+    fn template_flag_follows_the_file_name() {
+        let m = Migration::new(5, "add x", Direction::Up, "SELECT 1");
+        assert_eq!(m.file_name, "5_add_x.up.sql");
+        let m = m.with_template(true);
+        assert!(m.template);
+        assert_eq!(m.file_name, "5_add_x.up.sql.j2");
+        assert_eq!(m.checksum, checksum("SELECT 1"));
     }
 
     #[test]

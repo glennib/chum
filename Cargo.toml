@@ -25,11 +25,15 @@ default = ["cli"]
 # `help` text. Pulls in `miette` (no `fancy`) — kept optional so the default
 # library build (`--no-default-features`) stays on its advertised 7-dep contract.
 diagnostic = ["dep:miette"]
+# Render `.sql.j2` migrations with minijinja. Optional so the library built with
+# no default features keeps its documented dependency list; without it, a
+# source containing a template fails to load.
+template = ["dep:minijinja"]
 # The `chum` binary and its URL→client mapping. The library itself needs none
 # of these; a consumer that only uses the library can disable default features.
 # Enables `diagnostic` so the binary's `?` carries the library's rich error
 # diagnostics, and `miette/fancy` for the graphical terminal renderer.
-cli = ["diagnostic", "miette/fancy", "dep:clap", "dep:console", "dep:indicatif", "dep:percent-encoding", "dep:serde_json", "dep:tabled", "dep:tokio", "dep:tracing-subscriber", "dep:url"]
+cli = ["diagnostic", "template", "miette/fancy", "dep:clap", "dep:console", "dep:indicatif", "dep:percent-encoding", "dep:serde_json", "dep:tabled", "dep:tokio", "dep:tracing-subscriber", "dep:url"]
 
 [dependencies]
 # Library dependencies.
@@ -44,6 +48,12 @@ thiserror = "2"
 # Diagnostics: optional in the library (`diagnostic` feature), always on for the
 # CLI (`cli` adds `miette/fancy` for the graphical terminal renderer).
 miette = { version = "7", default-features = false, features = ["derive"], optional = true }
+
+# Templating: optional in the library (`template` feature), always on for the
+# CLI. Only the `builtins` and `macros` engine features: without
+# `multi_template` there is no `include`/`import`/`extends`, and these pull in
+# no transitive dependencies.
+minijinja = { version = "3.0.5", default-features = false, features = ["builtins", "macros"], optional = true }
 
 # CLI-only dependencies (gated behind the `cli` feature).
 clap = { version = "4.5", features = ["derive", "env"], optional = true }

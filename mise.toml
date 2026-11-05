@@ -21,6 +21,10 @@ run = "cargo clippy --all-targets --all-features -- -D warnings"
 description = "Run clippy on the library with no features (consumer contract)"
 run = "cargo clippy --lib --no-default-features -- -D warnings"
 
+[tasks."clippy:lib:template"]
+description = "Run clippy on the library with only the template feature"
+run = "cargo clippy --lib --no-default-features --features template -- -D warnings"
+
 [tasks.test]
 description = "Run tests"
 run = "cargo nextest run --all-targets --no-tests=pass"
@@ -36,6 +40,10 @@ run = "cargo build"
 [tasks."build:lib"]
 description = "Check the library compiles with no default features"
 run = "cargo build --lib --no-default-features"
+
+[tasks."build:lib:template"]
+description = "Check the library compiles with only the template feature"
+run = "cargo build --lib --no-default-features --features template"
 
 [tasks."db:up"]
 description = "Start a local ClickHouse for the e2e test (podman, falling back to docker)"
@@ -65,4 +73,4 @@ fi
 
 [tasks.ci]
 description = "Run all CI checks"
-depends = ["fmt:check", "clippy", "clippy:lib", "test", "build:debug", "build:lib"]
+depends = ["fmt:check", "clippy", "clippy:lib", "clippy:lib:template", "test", "build:debug", "build:lib", "build:lib:template"]

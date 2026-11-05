@@ -1,0 +1,4 @@
+{# Logs the cutoff it reverts with, so a test can see which value it got. #}
+INSERT INTO {{ env.log | sql_ident }}.reverted VALUES ({{ this.cutoff | sql_string }});
+
+DROP TABLE {{ env.db | sql_ident }}.cutoffs;
