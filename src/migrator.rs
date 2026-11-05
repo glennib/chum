@@ -17,6 +17,7 @@ use crate::split::split_statements;
 
 /// A migration that was applied during a [`Migrator::run`] call.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Applied {
     /// The version that was applied.
     pub version: i64,
@@ -39,6 +40,7 @@ pub enum State {
 
 /// A line of [`Migrator::info`] output.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Status {
     /// The version.
     pub version: i64,
@@ -57,6 +59,7 @@ pub struct Status {
 /// A migration that a [`Migrator::run`] would apply, as reported by
 /// [`Migrator::plan`] without applying anything.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Planned {
     /// The version that would be applied.
     pub version: i64,

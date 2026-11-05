@@ -33,6 +33,7 @@ impl Direction {
 /// parsing (yielding owned data) and, in a future iteration, by a
 /// `migrate!` proc-macro emitting `&'static` const data.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Migration {
     /// The numeric version parsed from the filename prefix.
     pub version: i64,
@@ -76,6 +77,7 @@ impl Migration {
 /// Reflects the latest marker recorded for the version (see
 /// [`crate::backend`]).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct AppliedMigration {
     /// The version that was applied.
     pub version: i64,

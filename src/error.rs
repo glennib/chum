@@ -8,6 +8,7 @@
 /// stays free of `miette` — the derive and its attributes vanish entirely.
 #[derive(Debug, thiserror::Error)]
 #[cfg_attr(feature = "diagnostic", derive(miette::Diagnostic))]
+#[non_exhaustive]
 pub enum ChumError {
     /// A migration source (directory or embedded tree) could not be read or
     /// a filename did not match `<version>_<name>.{up,down}.sql`.
