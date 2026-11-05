@@ -249,8 +249,59 @@ affected table has data, rather than on a particular environment. `chum render
 --from <version>` with a local `env.*` and no `this.*` shows whether a fresh
 database can migrate without per-apply values.
 
-The [design document](docs/design/templated-migrations.md) has worked examples
-and the reasoning behind these rules.
+### Example: a materialized view with a future cutoff
+
+A materialized view only processes rows inserted after it is created, so older
+rows come from a backfill that runs outside chum. To split the two without gaps
+or overlaps, the view filters on a cutoff in the future, and once the cutoff has
+passed the backfill inserts everything before it. Each environment applies the
+migration on its own day, with its own cutoff:
+
+```sql
+-- 20261106120000_events_hourly_mv.up.sql.j2
+{% if this.cutoff is defined %}
+SELECT throwIf(
+    toDateTime({{ this.cutoff | sql_string }}, 'UTC') <= now()
+        AND (SELECT count() FROM app.events) > 0,
+    'cutoff must be in the future while app.events has data'
+);
+{% else %}
+SELECT throwIf(
+    (SELECT count() FROM app.events) > 0,
+    'app.events has data: pass 20261106120000_cutoff'
+);
+{% endif %}
+
+CREATE MATERIALIZED VIEW app.events_hourly_mv
+TO app.events_hourly AS
+SELECT toStartOfHour(ts) AS hour, count() AS events
+FROM app.events
+{% if this.cutoff is defined %}
+WHERE ts >= toDateTime({{ this.cutoff | sql_string }}, 'UTC')
+{% endif %}
+GROUP BY hour;
+```
+
+The down needs no variables, so it can be a plain `.down.sql` file containing
+`DROP VIEW app.events_hourly_mv;`.
+
+The guards decide whether a cutoff is needed from the data, not from the
+environment's name. Once `app.events` has data (staging, production), a cutoff
+is required and must be in the future. While it is empty (a laptop, CI, a new or
+rebuilt database), the view covers everything from the start, there is nothing
+to backfill, and any cutoff or none is accepted.
+
+```bash
+chum --url "$STAGING_URL" run --var 20261106120000_cutoff='2026-11-06 14:00:00'
+```
+
+Where chum runs as a Kubernetes Job, the release that ships the migration adds
+`CHUM_VAR_20261106120000_cutoff` to the Job's environment. `run` ignores it once
+the version is applied, but `revert`, `force` and the guard in a rebuilt
+database still see it, so remove it once every environment has applied the
+migration. After the cutoff has passed, the backfill reads that environment's
+cutoff with the `chum info` query above and inserts `WHERE ts < cutoff`; no
+recorded cutoff means the table was empty and there is nothing to backfill.
 
 ## CLI
 

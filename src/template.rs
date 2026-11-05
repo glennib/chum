@@ -553,8 +553,6 @@ mod tests {
         assert!(refs.env.contains("anything"));
     }
 
-    // The examples from docs/design/templated-migrations.md.
-
     fn statements(r: &Rendered) -> Vec<String> {
         crate::split::split_statements(&r.sql).unwrap()
     }
