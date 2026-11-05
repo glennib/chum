@@ -11,6 +11,10 @@ use crate::migrator::State;
 /// [`miette::Diagnostic`], attaching a stable error `code` and an actionable
 /// `help` line to every variant. The library build with no default features
 /// stays free of `miette` — the derive and its attributes vanish entirely.
+///
+/// A variant that wraps another error returns it from
+/// [`source`](std::error::Error::source) and leaves it out of its own message,
+/// so a reporter that walks the chain (miette, anyhow's `{:#}`) prints it once.
 #[derive(Debug, thiserror::Error)]
 #[cfg_attr(feature = "diagnostic", derive(miette::Diagnostic))]
 #[non_exhaustive]
@@ -153,7 +157,7 @@ pub enum ChumError {
     },
 
     /// A ClickHouse query failed.
-    #[error("clickhouse error: {0}")]
+    #[error("ClickHouse request failed")]
     #[cfg_attr(
         feature = "diagnostic",
         diagnostic(
@@ -168,7 +172,7 @@ pub enum ChumError {
 
     /// Adding the `vars` column to an existing bookkeeping table failed,
     /// usually because chum's user lacks `ALTER` on it.
-    #[error("failed to upgrade the bookkeeping table: {source}")]
+    #[error("failed to upgrade the bookkeeping table")]
     #[cfg_attr(
         feature = "diagnostic",
         diagnostic(
@@ -188,7 +192,7 @@ pub enum ChumError {
     },
 
     /// An I/O error while reading migrations or scaffolding a new one.
-    #[error("io error: {0}")]
+    #[error("I/O error")]
     #[cfg_attr(
         feature = "diagnostic",
         diagnostic(
