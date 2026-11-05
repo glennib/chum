@@ -90,7 +90,167 @@ preview the renames first.
 bookkeeping table is keyed by the old versions, a database that already applied
 these migrations must afterward be reset (drop and recreate the database, then
 re-run `chum run`) or have each new version `chum force`d. Convert before a
-migration set is widely deployed.
+migration set is widely deployed. `convert` keeps the `.j2` suffix of
+[templated migrations](#templated-migrations), and reminds you to rename any
+version-prefixed `--var` / `CHUM_VAR_*` keys for the renumbered versions.
+
+## Templated migrations
+
+A migration file ending in `.sql.j2` is a [minijinja](https://docs.rs/minijinja)
+(Jinja2) template, rendered before it runs. Use it for SQL that differs between
+environments (a `GRANT` only in production, a retention period) or that needs a
+value only known at apply time (a backfill cutoff). Plain `.sql` files behave
+exactly as before. `chum add --template <name>` scaffolds a `.sql.j2` pair, and
+a template up with a plain down (or the reverse) is fine; a plain and a
+template file for the same version and direction is an error.
+
+```sql
+-- 20261106090000_events.up.sql.j2
+CREATE TABLE app.events (ts DateTime, user_id UInt64)
+ENGINE = MergeTree ORDER BY (user_id, ts);
+
+{% if env.tier == "prod" %}
+GRANT SELECT ON app.events TO analytics_reader;
+{% endif %}
+```
+
+Rendering depends only on the template and the variables you supply: no clock,
+no process environment, no database queries. Undefined variables are errors
+(strict mode), so a template that uses a value nobody passed fails before
+anything runs, and the error names the missing variable. Output is not escaped
+and whitespace is kept as written.
+
+### Variables
+
+Templates read variables from two namespaces, and the form of the key you
+supply picks the namespace:
+
+| Key | Example | Template sees | Meaning |
+| --- | --- | --- | --- |
+| `<name>` | `--var tier=prod` | `env.tier` | Describes the target environment; available to every migration. |
+| `<version>_<name>` | `--var 20261106120000_cutoff=2026-11-07` | `this.cutoff` | For that one version only. |
+
+Each key can be given as `--var <key>=<value>` (repeatable, before or after the
+subcommand) or as a `CHUM_VAR_<key>=<value>` environment variable, which suits a
+container deploy where per-environment values come from a ConfigMap. `--var`
+wins over `CHUM_VAR_<key>`. The version in a key is compared numerically
+(`0005_x` and `5_x` are the same key), names must match `[A-Za-z_][A-Za-z0-9_]*`,
+and giving the same key twice from one source is an error.
+
+`env.cutoff` and `this.cutoff` are different variables: a plain `cutoff` never
+reaches `this.cutoff`. Both namespaces always exist, so `is defined`,
+`| default(…)` and `env.get("x")` work on a missing key. The template author
+decides each variable's kind; to let an operator override an environment value
+for one migration, write `{{ this.tier | default(env.tier) }}`.
+
+Values are strings. Two filters quote them for SQL:
+
+- `sql_string` renders a single-quoted string literal with quotes and
+  backslashes escaped (`'it\'s'`), for values that end up as strings.
+- `sql_ident` renders a backquoted identifier (`` `my db` ``), for database,
+  table and column names.
+
+An unfiltered `{{ env.x }}` inserts the value verbatim, which is right for
+numbers and SQL fragments. Compare values (`{% if env.tier == "prod" %}`)
+rather than testing their truthiness: every non-empty string is true, `"false"`
+included. Prefer a required, compared value over `is defined` wherever a
+missing value is dangerous, since `is defined` turns a misspelt key into a
+silently skipped branch.
+
+Jinja processes the whole file, so `-- {{ env.x }}` still needs `env.x`; use
+`{# … #}` for comments about the template. SQL that contains Jinja syntax must
+be wrapped in `{% raw %}…{% endraw %}`. `include`, `import` and `extends` are
+not available: every template is self-contained.
+
+chum warns about a supplied key that no template in the source refers to (a
+typo such as `CHUM_VAR_teir`), and about a `--var` that no migration rendered
+by the command used.
+
+### When templates render, and which values they get
+
+| Command | Renders | Variables from |
+| --- | --- | --- |
+| `render` (offline) | the requested migrations | `--var`, `CHUM_VAR_*` |
+| `run`, `run --dry-run` | every pending migration up to `--target` | `--var`, `CHUM_VAR_*` |
+| `revert`, `revert --dry-run` | the down of each version reverted | supplied and recorded |
+| `force <version>` | the up, without executing it | supplied and recorded |
+| `info`, `add`, `convert`, `reset` | nothing | none |
+
+`run` renders and splits every pending migration before the first one runs, and
+`revert` does the same with its downs, so a missing variable or template error
+anywhere aborts the command before any migration statement runs, listing every
+migration that failed. `run --dry-run` lists each value it would use and where
+it came from (`--var`, environment, recorded or default).
+
+Each bookkeeping marker records the values the migration used, as namespaced
+keys (`env.tier`, `this.cutoff`): the values the up looked up while rendering,
+plus every supplied value its down refers to. Values from `| default(…)` aren't
+recorded. `revert` and `force` use them:
+
+- **`this.*`: recorded values win.** A supplied value that differs from the
+  recorded one is an error if the migration being rendered reads that name, and
+  is ignored otherwise, so a stale value left in a deploy spec can't block a
+  migration that doesn't use it. A supplied value for a name that wasn't
+  recorded fills the gap.
+- **`env.*`: supplied values win**, since the environment may have changed since
+  the apply; recorded values fill gaps, and chum warns when a supplied value
+  differs from the recorded one.
+
+`chum info` shows the recorded values in a `vars` column (a `vars` object in
+JSON). For pending templates, JSON output also lists `template_vars`, the
+namespaced names the up template refers to, so you can see what to pass. Read
+recorded values only from an **applied** version, since a dirty marker records a
+failed attempt:
+
+```bash
+chum --json info \
+  | jq -r '.[] | select(.version == 20261106120000 and .state == "applied") | .vars["this.cutoff"] // empty'
+```
+
+The checksum covers the template text, not the rendered SQL, so environments
+that ran different SQL record the same checksum, and editing an applied
+template is drift as usual.
+
+### Previewing: `chum render`
+
+`chum render` prints the SQL migrations render to and never connects to
+ClickHouse, so it works in CI or code review and doubles as a pre-flight check:
+it fails exactly where `run` would.
+
+```text
+chum render [VERSION]... [--from VERSION] [--down] [--var key=value]...
+```
+
+With versions it renders those; with `--from`, every migration from that
+version on; with neither, every template in the source. `--down` renders the
+downs instead, newest first. Plain migrations are printed as they are. Each
+migration is preceded by a `-- <file>` comment and the output is valid SQL.
+`render` can't see recorded values, so `render --down` matches what `revert`
+would run only when given the values the up used.
+
+### Guards and `chum reset`
+
+chum doesn't type or validate variables. Check them in SQL with `throwIf`, next
+to where they are used; it runs on the server before the statements after it:
+
+```sql
+SELECT throwIf({{ env.tier | sql_string }} NOT IN ('local', 'staging', 'prod'), 'unknown tier');
+```
+
+A failing guard leaves the version dirty with nothing applied. Fix the input,
+run `chum reset <version>` to make the version pending again, and run again.
+`reset` deletes the version's bookkeeping rows and touches no database objects,
+so use it only when the failed attempt left nothing behind (or you cleaned up by
+hand). It refuses a version that isn't dirty.
+
+Every migration also runs in every fresh database (a laptop, CI, a rebuild), so
+guard on the condition that makes a value necessary, such as whether the
+affected table has data, rather than on a particular environment. `chum render
+--from <version>` with a local `env.*` and no `this.*` shows whether a fresh
+database can migrate without per-apply values.
+
+The [design document](docs/design/templated-migrations.md) has worked examples
+and the reasoning behind these rules.
 
 ## CLI
 
@@ -150,7 +310,7 @@ variables:
 | `--format` | — | `auto` | `auto` \| `pretty` \| `json` \| `tsv` (`auto` = table on a tty, TSV when piped) |
 | `--json` | — | — | Shorthand for `--format json` |
 | `--color` | — | `auto` | `auto` \| `always` \| `never` (honors `NO_COLOR`) |
-| `--var <key>=<value>` | `CHUM_VAR_<key>` | — | A variable for templated (`.sql.j2`) migrations. Repeatable. A plain key sets `env.<key>`; a version-prefixed key (`<version>_<name>`) sets `this.<name>` for that version only. `--var` wins over `CHUM_VAR_<key>`. Accepted by `run`, `revert`, `render` and `force`, before or after the subcommand. |
+| `--var <key>=<value>` | `CHUM_VAR_<key>` | — | A variable for [templated migrations](#templated-migrations). Repeatable. A plain key sets `env.<key>`; a version-prefixed key (`<version>_<name>`) sets `this.<name>` for that version only. `--var` wins over `CHUM_VAR_<key>`. Accepted by `run`, `revert`, `render` and `force`, before or after the subcommand. |
 
 `--url` accepts either a bare HTTP endpoint or a full DSN, e.g.
 `clickhouse+https://user:pass@host:8123/mydb?secure=true`. The CLI maps it to
@@ -256,6 +416,12 @@ migrator.run(&client, &bookkeeping, None).await?;
 # }
 ```
 
+Templated migrations need the `template` feature (enabled by `cli`), which
+adds the `minijinja` dependency. Pass variables with `Migrator::vars`, e.g.
+`Vars::new().with_env("tier", "prod")`, or build them from `--var`-style keys
+with `Vars::from_keys`. Without the feature, a source containing a `.sql.j2`
+file fails to load with `TemplatingDisabled`.
+
 The migrator takes a [`Bookkeeping`] target (database + table). It runs
 `CREATE DATABASE IF NOT EXISTS` for the bookkeeping database and fully-qualifies
 all bookkeeping SQL, so it never needs an app database to exist.
@@ -286,7 +452,18 @@ statements, then writes a `success = true` marker. The latest state per version
 is read with `argMax(col, seq)`, where `seq` is a server-assigned nanosecond
 counter (this also leaves a full audit trail of every attempt). If an apply
 fails partway, the latest marker stays `false` and the version reads as
-**dirty** until resolved (fix the schema by hand, then `chum force <version>`).
+**dirty** until resolved (fix the schema by hand, then `chum force <version>`;
+or, if the attempt changed nothing, `chum reset <version>` to make it pending
+again).
+
+Each marker also records, in a `vars Map(String, String)` column, the template
+variables the migration used (see
+[Templated migrations](#when-templates-render-and-which-values-they-get)); plain
+migrations record an empty map. A table created by an older chum lacks the
+column: commands that write markers (`run`, `revert`, `force`) add it with
+`ALTER TABLE … ADD COLUMN IF NOT EXISTS`, and read-only commands treat it as
+empty without altering the table. An older chum keeps working against the
+upgraded table, since it names its columns.
 
 `chum` does **not** adopt databases previously migrated by another tool — an
 already-migrated database must be handled manually (e.g. `chum force` each
