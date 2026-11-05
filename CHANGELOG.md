@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/glennib/chum/compare/v0.2.5...v0.3.0) - 2026-11-05
+
+### Added
+
+- name the failing statement when a migration fails
+- expose templated migrations in the CLI
+- [**breaking**] render .sql.j2 migrations with minijinja
+- [**breaking**] add a vars column to the bookkeeping table
+- [**breaking**] mark public data and error types non_exhaustive
+
+### Fixed
+
+- print each wrapped error once in reports
+- mark a version dirty while it is being reverted
+
+### Other
+
+- drop the templated-migrations design document
+- document templated migrations in the README
+- propose templated migrations
+
 ## [0.2.5](https://github.com/glennib/chum/compare/v0.2.4...v0.2.5) - 2026-11-05
 
 ### Other
