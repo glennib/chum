@@ -68,9 +68,12 @@
 //! cross-replica behavior is documented but not yet exercised against the Aiven
 //! cluster.
 
+use std::collections::BTreeMap;
+
 use crate::error::ChumError;
 use crate::error::Result;
 use crate::migration::AppliedMigration;
+use crate::migration::Migration;
 
 /// Where chum keeps its bookkeeping: the dedicated database plus the table
 /// within it. Every bookkeeping statement is fully-qualified as
@@ -146,6 +149,7 @@ struct AppliedRow {
     #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
     applied_at: chrono::DateTime<chrono::Utc>,
     success: bool,
+    vars: Vec<(String, String)>,
 }
 
 /// Create the bookkeeping database if it does not already exist.
@@ -186,7 +190,8 @@ pub async fn ensure_table(client: &clickhouse::Client, bookkeeping: &Bookkeeping
              execution_ms UInt64,
              success      Bool,
              applied_at   DateTime64(3, 'UTC') DEFAULT now64(3),
-             seq          UInt64
+             seq          UInt64,
+             vars         Map(String, String)
          )
          ENGINE = MergeTree
          ORDER BY (version, seq)"
@@ -195,7 +200,72 @@ pub async fn ensure_table(client: &clickhouse::Client, bookkeeping: &Bookkeeping
     Ok(())
 }
 
+/// The statement that adds the `vars` column to a bookkeeping table created
+/// before chum recorded variables.
+#[must_use]
+pub fn upgrade_statement(bookkeeping: &Bookkeeping) -> String {
+    format!(
+        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS vars Map(String, String)",
+        bookkeeping.qualified()
+    )
+}
+
+/// Whether the bookkeeping table has the `vars` column.
+///
+/// # Errors
+///
+/// Returns [`ChumError::ClickHouse`] if the query fails.
+pub async fn has_vars_column(
+    client: &clickhouse::Client,
+    bookkeeping: &Bookkeeping,
+) -> Result<bool> {
+    let n: u64 = client
+        .query(
+            "SELECT count() FROM system.columns WHERE database = ? AND table = ? AND name = 'vars'",
+        )
+        .bind(bookkeeping.database())
+        .bind(bookkeeping.table())
+        .fetch_one()
+        .await?;
+    Ok(n > 0)
+}
+
+/// Add the `vars` column to a bookkeeping table that lacks it, returning the
+/// statement that was run, or `None` when the column was already there.
+///
+/// Only commands that write bookkeeping rows call this; read-only commands
+/// read a missing column as empty maps (see [`list_applied`]), so inspecting a
+/// database never alters it. The change is additive: an older chum names its
+/// columns on insert and select, so it keeps working against the upgraded
+/// table.
+///
+/// # Errors
+///
+/// Returns [`ChumError::BookkeepingUpgrade`], carrying the statement, if the
+/// `ALTER` is refused, or [`ChumError::ClickHouse`] if the column lookup fails.
+pub async fn upgrade_table(
+    client: &clickhouse::Client,
+    bookkeeping: &Bookkeeping,
+) -> Result<Option<String>> {
+    if has_vars_column(client, bookkeeping).await? {
+        return Ok(None);
+    }
+    let statement = upgrade_statement(bookkeeping);
+    client
+        .query(&statement)
+        .execute()
+        .await
+        .map_err(|source| ChumError::BookkeepingUpgrade {
+            statement: statement.clone(),
+            source,
+        })?;
+    Ok(Some(statement))
+}
+
 /// Return the latest recorded state of each version, ordered ascending.
+///
+/// A table without the `vars` column reads every version's variables as
+/// empty.
 ///
 /// # Errors
 ///
@@ -205,13 +275,19 @@ pub async fn list_applied(
     bookkeeping: &Bookkeeping,
 ) -> Result<Vec<AppliedMigration>> {
     let table = bookkeeping.qualified();
+    let vars = if has_vars_column(client, bookkeeping).await? {
+        "argMax(vars, seq)"
+    } else {
+        "CAST(map(), 'Map(String, String)')"
+    };
     let sql = format!(
         "SELECT version,
                 argMax(description, seq)  AS description,
                 argMax(checksum, seq)     AS checksum,
                 argMax(execution_ms, seq) AS execution_ms,
                 argMax(applied_at, seq)   AS applied_at,
-                argMax(success, seq)      AS success
+                argMax(success, seq)      AS success,
+                {vars}                    AS vars
          FROM {table}
          GROUP BY version
          ORDER BY version"
@@ -226,14 +302,17 @@ pub async fn list_applied(
             execution_ms: r.execution_ms,
             applied_at: r.applied_at,
             success: r.success,
+            vars: r.vars.into_iter().collect(),
         })
         .collect())
 }
 
-/// Append a marker row recording an apply attempt or completion.
+/// Append a marker row recording an apply attempt or completion of
+/// `migration`, with the variables it used.
 ///
 /// `applied_at` falls back to its `DEFAULT now64(3)`; `seq` is a server-side
-/// nanosecond counter so the latest marker per version is unambiguous.
+/// nanosecond counter so the latest marker per version is unambiguous. The
+/// table must have the `vars` column (see [`upgrade_table`]).
 ///
 /// # Errors
 ///
@@ -241,25 +320,29 @@ pub async fn list_applied(
 pub async fn record(
     client: &clickhouse::Client,
     bookkeeping: &Bookkeeping,
-    version: i64,
-    description: &str,
-    checksum: &str,
+    migration: &Migration,
     execution_ms: u64,
     success: bool,
+    vars: &BTreeMap<String, String>,
 ) -> Result<()> {
     let table = bookkeeping.qualified();
     let sql = format!(
         "INSERT INTO {table}
-             (version, description, checksum, execution_ms, success, seq)
-         SELECT ?, ?, ?, ?, ?, toUnixTimestamp64Nano(now64(9))"
+             (version, description, checksum, execution_ms, success, seq, vars)
+         SELECT ?, ?, ?, ?, ?, toUnixTimestamp64Nano(now64(9)),
+                CAST(mapFromArrays(?, ?), 'Map(String, String)')"
     );
+    let (keys, values): (Vec<&str>, Vec<&str>) =
+        vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).unzip();
     client
         .query(&sql)
-        .bind(version)
-        .bind(description)
-        .bind(checksum)
+        .bind(migration.version)
+        .bind(migration.description.as_ref())
+        .bind(migration.checksum.as_ref())
         .bind(execution_ms)
         .bind(success)
+        .bind(keys)
+        .bind(values)
         .execute()
         .await?;
     Ok(())

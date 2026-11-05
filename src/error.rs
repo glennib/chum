@@ -111,6 +111,27 @@ pub enum ChumError {
     )]
     ClickHouse(#[from] clickhouse::error::Error),
 
+    /// Adding the `vars` column to an existing bookkeeping table failed,
+    /// usually because chum's user lacks `ALTER` on it.
+    #[error("failed to upgrade the bookkeeping table: {source}")]
+    #[cfg_attr(
+        feature = "diagnostic",
+        diagnostic(
+            code(chum::bookkeeping_upgrade),
+            help(
+                "chum adds this column to bookkeeping tables created by older versions. Grant \
+                 chum's user ALTER on the bookkeeping table, or have an administrator run: \
+                 {statement}"
+            )
+        )
+    )]
+    BookkeepingUpgrade {
+        /// The `ALTER TABLE` statement that was refused.
+        statement: String,
+        /// The ClickHouse error.
+        source: clickhouse::error::Error,
+    },
+
     /// An I/O error while reading migrations or scaffolding a new one.
     #[error("io error: {0}")]
     #[cfg_attr(

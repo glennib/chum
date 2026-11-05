@@ -43,6 +43,10 @@ static BOOTSTRAP_MIGRATIONS_OVERRIDE: Dir =
 static QUESTION_MARK_MIGRATIONS: Dir =
     include_dir!("$CARGO_MANIFEST_DIR/tests/question_mark_migrations");
 
+/// A self-bootstrapping migration used against a bookkeeping table created
+/// with the schema chum used before it recorded variables.
+static UPGRADE_MIGRATIONS: Dir = include_dir!("$CARGO_MANIFEST_DIR/tests/upgrade_migrations");
+
 const TEST_DB: &str = "chum_integration_test";
 const TABLE: &str = "_chum_migrations";
 /// The dedicated bookkeeping database used by these tests. Kept distinct from
@@ -378,6 +382,96 @@ async fn question_marks_in_migration_sql_are_sent_verbatim() {
         "revert dropped the app database"
     );
 
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {bookkeeping_db}")).await;
+}
+
+/// A bookkeeping table without the `vars` column, as older chum versions
+/// created it, is read as having empty variables by read-only commands, which
+/// leave it alone, and gains the column on the first writing command. Inserts
+/// that don't name `vars`, as an older chum writes them, keep working.
+#[tokio::test]
+#[ignore = "requires a running ClickHouse (mise run db:up)"]
+async fn writing_commands_add_the_vars_column_to_an_old_table() {
+    let admin = client("default");
+    let bookkeeping_db = "chum_it_upgrade_bk";
+    let app_db = "chum_upgrade_app";
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {app_db}")).await;
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {bookkeeping_db}")).await;
+    exec(&admin, &format!("CREATE DATABASE {bookkeeping_db}")).await;
+    exec(
+        &admin,
+        &format!(
+            "CREATE TABLE {bookkeeping_db}.{TABLE}
+             (
+                 version      Int64,
+                 description  String,
+                 checksum     String,
+                 execution_ms UInt64,
+                 success      Bool,
+                 applied_at   DateTime64(3, 'UTC') DEFAULT now64(3),
+                 seq          UInt64
+             )
+             ENGINE = MergeTree
+             ORDER BY (version, seq)"
+        ),
+    )
+    .await;
+
+    let db = unpinned_client();
+    let bookkeeping = Bookkeeping::new(bookkeeping_db, TABLE).expect("valid bookkeeping");
+    let migrator =
+        Migrator::new(source::from_dir(&UPGRADE_MIGRATIONS).expect("embedded migrations"));
+
+    let statuses = migrator.info(&db, &bookkeeping).await.expect("info");
+    assert_eq!(statuses[0].state, State::Pending);
+    assert!(statuses[0].vars.is_empty());
+    migrator
+        .plan(&db, &bookkeeping, None)
+        .await
+        .expect("dry run");
+    assert!(
+        !chum::backend::has_vars_column(&db, &bookkeeping)
+            .await
+            .expect("column lookup"),
+        "read-only commands leave the table alone"
+    );
+
+    migrator.run(&db, &bookkeeping, None).await.expect("run");
+    assert!(
+        chum::backend::has_vars_column(&db, &bookkeeping)
+            .await
+            .expect("column lookup"),
+        "run added the column"
+    );
+    let recorded = chum::backend::list_applied(&db, &bookkeeping)
+        .await
+        .expect("list_applied");
+    assert!(recorded[0].success);
+    assert!(recorded[0].vars.is_empty());
+
+    // An older chum's insert names its columns and omits `vars`.
+    exec(
+        &admin,
+        &format!(
+            "INSERT INTO {bookkeeping_db}.{TABLE}
+                 (version, description, checksum, execution_ms, success, seq)
+             SELECT 1, 'upgrade', '{}', 0, true, toUnixTimestamp64Nano(now64(9))",
+            recorded[0].checksum
+        ),
+    )
+    .await;
+    let recorded = chum::backend::list_applied(&db, &bookkeeping)
+        .await
+        .expect("list_applied after an old-style insert");
+    assert!(recorded[0].success);
+    assert!(recorded[0].vars.is_empty());
+
+    migrator
+        .undo(&db, &bookkeeping, i64::MIN)
+        .await
+        .expect("undo");
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {app_db}")).await;
     exec(&admin, &format!("DROP DATABASE IF EXISTS {bookkeeping_db}")).await;
 }
 

@@ -2,6 +2,7 @@
 //! representation of a migration that has already been applied to a database.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 
 use sha2::Digest;
 use sha2::Sha384;
@@ -93,6 +94,10 @@ pub struct AppliedMigration {
     /// Whether the migration completed successfully. A `false` value marks
     /// the version as *dirty* (a partial / failed apply).
     pub success: bool,
+    /// The variables the latest marker recorded, keyed by namespaced name
+    /// (`env.tier`, `this.cutoff`). Empty for plain migrations and for rows
+    /// written before chum recorded variables.
+    pub vars: BTreeMap<String, String>,
 }
 
 /// Compute the hex-encoded SHA-384 checksum of a migration's SQL.

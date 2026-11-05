@@ -2,6 +2,7 @@
 //! applies, reverts, or reports migrations.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::time::Duration;
 use std::time::Instant;
@@ -25,6 +26,8 @@ pub struct Applied {
     pub description: String,
     /// How long the migration's statements took to execute.
     pub elapsed: Duration,
+    /// The variables recorded for the migration, keyed by namespaced name.
+    pub vars: BTreeMap<String, String>,
 }
 
 /// The state of a single version, as reported by [`Migrator::info`].
@@ -54,6 +57,9 @@ pub struct Status {
     /// How long the migration's statements took, in milliseconds, if it is
     /// recorded as applied. `None` for pending (and dirty) versions.
     pub execution_ms: Option<u64>,
+    /// The variables the latest marker recorded, keyed by namespaced name
+    /// (`env.tier`). Empty for pending versions.
+    pub vars: BTreeMap<String, String>,
 }
 
 /// A migration that a [`Migrator::run`] would apply, as reported by
@@ -186,8 +192,7 @@ impl Migrator {
     where
         F: FnMut(Progress<'_>),
     {
-        backend::ensure_database(client, bookkeeping).await?;
-        backend::ensure_table(client, bookkeeping).await?;
+        ensure_writable(client, bookkeeping).await?;
         let applied = self.validated_applied(client, bookkeeping).await?;
 
         let mut report = Vec::new();
@@ -214,6 +219,7 @@ impl Migrator {
                     version: migration.version,
                     description: migration.description.to_string(),
                     elapsed,
+                    vars: BTreeMap::new(),
                 });
             }
         }
@@ -293,8 +299,7 @@ impl Migrator {
     where
         F: FnMut(Progress<'_>),
     {
-        backend::ensure_database(client, bookkeeping).await?;
-        backend::ensure_table(client, bookkeeping).await?;
+        ensure_writable(client, bookkeeping).await?;
         let applied = self.validated_applied(client, bookkeeping).await?;
 
         let mut versions: Vec<i64> = applied
@@ -374,21 +379,11 @@ impl Migrator {
         bookkeeping: &Bookkeeping,
         version: i64,
     ) -> Result<()> {
-        backend::ensure_database(client, bookkeeping).await?;
-        backend::ensure_table(client, bookkeeping).await?;
+        ensure_writable(client, bookkeeping).await?;
         let migration = self
             .up(version)
             .ok_or_else(|| ChumError::Source(format!("unknown migration version {version}")))?;
-        backend::record(
-            client,
-            bookkeeping,
-            version,
-            &migration.description,
-            &migration.checksum,
-            0,
-            true,
-        )
-        .await?;
+        backend::record(client, bookkeeping, migration, 0, true, &BTreeMap::new()).await?;
         Ok(())
     }
 
@@ -430,6 +425,7 @@ impl Migrator {
                 state,
                 applied_at,
                 execution_ms,
+                vars: rec.map(|rec| rec.vars.clone()).unwrap_or_default(),
             });
         }
         statuses.sort_by_key(|s| s.version);
@@ -476,16 +472,8 @@ impl Migrator {
         let statements = split_statements(&migration.sql)
             .map_err(|message| ChumError::Split { version, message })?;
 
-        backend::record(
-            client,
-            bookkeeping,
-            version,
-            &migration.description,
-            &migration.checksum,
-            0,
-            false,
-        )
-        .await?;
+        let vars = BTreeMap::new();
+        backend::record(client, bookkeeping, migration, 0, false, &vars).await?;
 
         let start = Instant::now();
         for stmt in &statements {
@@ -495,17 +483,18 @@ impl Migrator {
         let elapsed = start.elapsed();
 
         let ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-        backend::record(
-            client,
-            bookkeeping,
-            version,
-            &migration.description,
-            &migration.checksum,
-            ms,
-            true,
-        )
-        .await?;
+        backend::record(client, bookkeeping, migration, ms, true, &vars).await?;
 
         Ok(elapsed)
     }
+}
+
+/// Prepare the bookkeeping table for a command that writes markers: create the
+/// database and table if missing, and add the `vars` column to a table created
+/// by an older chum.
+async fn ensure_writable(client: &clickhouse::Client, bookkeeping: &Bookkeeping) -> Result<()> {
+    backend::ensure_database(client, bookkeeping).await?;
+    backend::ensure_table(client, bookkeeping).await?;
+    backend::upgrade_table(client, bookkeeping).await?;
+    Ok(())
 }
