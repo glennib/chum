@@ -780,7 +780,14 @@ async fn failed_statements_leave_the_version_dirty() {
         .run(&db, &bookkeeping, None)
         .await
         .expect_err("throwIf");
-    assert!(matches!(err, ChumError::ClickHouse(_)), "{err}");
+    assert!(
+        matches!(
+            &err,
+            ChumError::StatementFailed { version: 2, direction: Direction::Up, index: 2, total: 2, statement, .. }
+                if statement.contains("throwIf")
+        ),
+        "{err}"
+    );
     let err = Migrator::new(failing_up)
         .run(&db, &bookkeeping, None)
         .await
@@ -795,7 +802,19 @@ async fn failed_statements_leave_the_version_dirty() {
         .undo(&db, &bookkeeping, 0)
         .await
         .expect_err("missing table");
-    assert!(matches!(err, ChumError::ClickHouse(_)), "{err}");
+    assert!(
+        matches!(
+            err,
+            ChumError::StatementFailed {
+                version: 1,
+                direction: Direction::Down,
+                index: 2,
+                total: 2,
+                ..
+            }
+        ),
+        "{err}"
+    );
     let statuses = migrator.info(&db, &bookkeeping).await.expect("info");
     assert_eq!(statuses[0].state, State::Dirty);
     let err = migrator

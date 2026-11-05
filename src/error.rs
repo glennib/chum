@@ -123,6 +123,35 @@ pub enum ChumError {
     )]
     DirtyRevert(i64),
 
+    /// A statement of a migration failed. Statements before it ran and are not
+    /// rolled back, so the version is left dirty.
+    #[error(
+        "migration {version} ({}) failed at statement {index} of {total}, `{}`",
+        .direction.as_str(),
+        excerpt(.statement)
+    )]
+    #[cfg_attr(
+        feature = "diagnostic",
+        diagnostic(
+            code(chum::statement_failed),
+            help("{}", statement_help(*version, *direction, *index))
+        )
+    )]
+    StatementFailed {
+        /// The version whose migration failed.
+        version: i64,
+        /// Whether it was being applied (`Up`) or reverted (`Down`).
+        direction: Direction,
+        /// The 1-based position of the failing statement.
+        index: usize,
+        /// How many statements the migration has.
+        total: usize,
+        /// The failing statement, as sent to ClickHouse.
+        statement: String,
+        /// The ClickHouse error.
+        source: clickhouse::error::Error,
+    },
+
     /// A ClickHouse query failed.
     #[error("clickhouse error: {0}")]
     #[cfg_attr(
@@ -330,5 +359,98 @@ fn render_message(failures: &[RenderFailure]) -> String {
     out
 }
 
+/// The first line of `statement` that isn't blank or a `--` comment, cut to a
+/// length that fits in an error message.
+fn excerpt(statement: &str) -> String {
+    const MAX_CHARS: usize = 60;
+    let line = statement
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with("--"))
+        .unwrap_or_default();
+    match line.char_indices().nth(MAX_CHARS) {
+        Some((cut, _)) => format!("{}…", &line[..cut]),
+        None => line.to_owned(),
+    }
+}
+
+#[cfg_attr(
+    not(feature = "diagnostic"),
+    expect(dead_code, reason = "only the diagnostic help uses it")
+)]
+fn statement_help(version: i64, direction: Direction, index: usize) -> String {
+    let ran = match index {
+        1 => String::new(),
+        2 => "statement 1, which ran, or ".to_owned(),
+        n => format!("statements 1 to {}, which ran, or ", n - 1),
+    };
+    let resolve = match direction {
+        Direction::Up => format!(
+            "finish the migration by hand and run `chum force {version}`, or undo what it did and \
+             run `chum reset {version}` to apply it again"
+        ),
+        Direction::Down => format!(
+            "finish the revert by hand and run `chum reset {version}`, or restore what it removed \
+             and run `chum force {version}`"
+        ),
+    };
+    format!(
+        "ClickHouse doesn't roll back {ran}what the failing statement did, so version {version} \
+         is now dirty. Fix the cause, then either {resolve}."
+    )
+}
+
 /// Convenience result alias.
 pub type Result<T> = std::result::Result<T, ChumError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn excerpt_skips_comments_and_truncates_long_lines() {
+        assert_eq!(
+            excerpt("-- add t\n\n  CREATE TABLE t\n(a UInt8)"),
+            "CREATE TABLE t"
+        );
+        let long = format!("SELECT '{}'", "é".repeat(80));
+        let cut = excerpt(&long);
+        assert_eq!(cut.chars().count(), 61, "{cut}");
+        assert!(cut.ends_with('…'), "{cut}");
+    }
+
+    #[test]
+    fn statement_failed_names_the_statement_and_its_position() {
+        let err = ChumError::StatementFailed {
+            version: 7,
+            direction: Direction::Down,
+            index: 2,
+            total: 3,
+            statement: "-- c\nDROP TABLE app.t\nSYNC".to_owned(),
+            source: clickhouse::error::Error::Custom("boom".to_owned()),
+        };
+        assert_eq!(
+            err.to_string(),
+            "migration 7 (down) failed at statement 2 of 3, `DROP TABLE app.t`"
+        );
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn statement_help_names_what_ran_and_how_to_resolve() {
+        let first = statement_help(7, Direction::Up, 1);
+        assert!(
+            first.starts_with("ClickHouse doesn't roll back what the failing"),
+            "{first}"
+        );
+        let third = statement_help(7, Direction::Up, 3);
+        assert!(third.contains("statements 1 to 2, which ran"), "{third}");
+        assert!(third.contains("`chum force 7`"), "{third}");
+        let down = statement_help(7, Direction::Down, 2);
+        assert!(down.contains("statement 1, which ran"), "{down}");
+        assert!(
+            down.contains("finish the revert by hand and run `chum reset 7`"),
+            "{down}"
+        );
+    }
+}

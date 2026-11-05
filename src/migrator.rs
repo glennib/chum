@@ -461,10 +461,7 @@ impl Migrator {
             let version = p.migration.version;
             on_progress(Progress::RevertStarted { version });
             backend::record_revert_started(client, bookkeeping, rec).await?;
-            for stmt in &p.statements {
-                // `query` would treat any `?` as a bind placeholder.
-                client.query_raw(stmt).execute().await?;
-            }
+            execute(client, &p).await?;
             backend::delete_version(client, bookkeeping, version).await?;
             on_progress(Progress::RevertFinished { version });
             reverted.push(version);
@@ -938,10 +935,7 @@ impl Migrator {
         backend::record(client, bookkeeping, migration, 0, false, vars).await?;
 
         let start = Instant::now();
-        for stmt in &prepared.statements {
-            // `query` would treat any `?` as a bind placeholder.
-            client.query_raw(stmt).execute().await?;
-        }
+        execute(client, prepared).await?;
         let elapsed = start.elapsed();
 
         let ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
@@ -958,6 +952,29 @@ async fn ensure_writable(client: &clickhouse::Client, bookkeeping: &Bookkeeping)
     backend::ensure_database(client, bookkeeping).await?;
     backend::ensure_table(client, bookkeeping).await?;
     backend::upgrade_table(client, bookkeeping).await?;
+    Ok(())
+}
+
+/// Run a prepared migration's statements in order, stopping at the first
+/// failure.
+async fn execute(client: &clickhouse::Client, prepared: &Prepared<'_>) -> Result<()> {
+    let migration = prepared.migration;
+    let total = prepared.statements.len();
+    for (i, stmt) in prepared.statements.iter().enumerate() {
+        // `query` would treat any `?` as a bind placeholder.
+        client
+            .query_raw(stmt)
+            .execute()
+            .await
+            .map_err(|source| ChumError::StatementFailed {
+                version: migration.version,
+                direction: migration.direction,
+                index: i + 1,
+                total,
+                statement: stmt.clone(),
+                source,
+            })?;
+    }
     Ok(())
 }
 

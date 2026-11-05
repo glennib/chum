@@ -509,6 +509,7 @@ again). A revert likewise writes a `success = false` marker before running the
 down migration and deletes the version's rows once it finishes, so a revert that
 fails partway also leaves the version dirty. Finish the revert by hand and run
 `chum reset <version>`, or restore the version and run `chum force <version>`.
+The error names the failing statement and its position in the file.
 
 Each marker also records, in a `vars Map(String, String)` column, the template
 variables the migration used (see
