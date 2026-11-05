@@ -106,10 +106,14 @@ chum revert --dry-run          # show what would be reverted, without reverting
 chum revert --steps 2 --yes    # revert without the confirmation prompt
 chum add add_users_table       # scaffold an up/down pair (continues the dir's scheme; timestamp by default)
 chum add --sequential initial  # start a fresh dir with sequential numbers (0001, 0002, …)
+chum add --template backfill   # scaffold a .sql.j2 template pair instead of plain .sql
+chum render --var tier=prod    # print the SQL every template renders to (offline)
+chum render --from 20260626 --down  # print the down SQL from a version on, newest first
 chum convert sequential        # renumber every migration to 0001, 0002, … (renames files)
 chum convert timestamp         # renumber every migration to UTC timestamps
 chum convert sequential --dry-run   # show the renames without performing them
 chum force 20260626111407      # mark applied without running (clears dirty)
+chum reset 20260626111407      # make a dirty version pending again (asks first)
 ```
 
 ### Output format
@@ -146,6 +150,7 @@ variables:
 | `--format` | — | `auto` | `auto` \| `pretty` \| `json` \| `tsv` (`auto` = table on a tty, TSV when piped) |
 | `--json` | — | — | Shorthand for `--format json` |
 | `--color` | — | `auto` | `auto` \| `always` \| `never` (honors `NO_COLOR`) |
+| `--var <key>=<value>` | `CHUM_VAR_<key>` | — | A variable for templated (`.sql.j2`) migrations. Repeatable. A plain key sets `env.<key>`; a version-prefixed key (`<version>_<name>`) sets `this.<name>` for that version only. `--var` wins over `CHUM_VAR_<key>`. Accepted by `run`, `revert`, `render` and `force`, before or after the subcommand. |
 
 `--url` accepts either a bare HTTP endpoint or a full DSN, e.g.
 `clickhouse+https://user:pass@host:8123/mydb?secure=true`. The CLI maps it to
@@ -182,8 +187,12 @@ sets `CLICKHOUSE_DATABASE=<appdb>`; inheriting it would pin chum's session to an
 app database that may not exist yet, breaking the create-your-own-database flow
 (below) even though bookkeeping lives in `--bookkeeping-database`.
 
-Only `CHUM_TABLE` and `CHUM_BOOKKEEPING_DATABASE` are env-readable — those are
-`CHUM_*` tool config, not part of the connection target.
+Only `CHUM_TABLE`, `CHUM_BOOKKEEPING_DATABASE`, `CHUM_SOURCE` and the
+`CHUM_VAR_<key>` template variables are env-readable — those are `CHUM_*` tool
+config, not part of the connection target. `CHUM_VAR_<key>` is the one family
+clap can't declare, because the prefix is dynamic: chum reads every environment
+variable starting with `CHUM_VAR_` and nothing else, so an unrelated `PATH` or
+`CLICKHOUSE_URL` never reaches a template.
 
 ### `--database` vs `--bookkeeping-database`
 

@@ -2,10 +2,14 @@
 //!
 //! The CLI owns the connection story: it maps a single connection URL (plus
 //! optional overrides) to a [`clickhouse::Client`]. The library is given the
-//! ready-made client and knows nothing about URLs.
+//! ready-made client and knows nothing about URLs. It also turns `--var` and
+//! `CHUM_VAR_*` into the variables templated migrations render with.
 
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::io::IsTerminal as _;
 use std::io::Write as _;
 use std::path::Path;
@@ -14,9 +18,13 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use chrono::SecondsFormat;
+use chum::Direction;
 use chum::Migrator;
+use chum::Origin;
 use chum::Progress;
 use chum::State;
+use chum::VarNotice;
+use chum::Vars;
 use chum::source;
 use clap::Parser;
 use clap::Subcommand;
@@ -380,7 +388,8 @@ struct Cli {
     )]
     bookkeeping_database: String,
 
-    /// Directory containing `<version>_<name>.{up,down}.sql` migration files.
+    /// Directory containing `<version>_<name>.{up,down}.sql` migration files
+    /// (and `.sql.j2` templates).
     #[arg(long, env = "CHUM_SOURCE", default_value = "migrations", global = true)]
     source: PathBuf,
 
@@ -406,8 +415,58 @@ struct Cli {
     #[arg(long, env = "CHUM_STRICT_CONSISTENCY", global = true)]
     strict_consistency: bool,
 
+    #[command(flatten)]
+    var: VarArgs,
+
     #[command(subcommand)]
     command: Command,
+}
+
+/// `--var`, accepted both before the subcommand and after the subcommands that
+/// render templates.
+///
+/// Not a clap `global` arg: clap keeps only the occurrences after the
+/// subcommand when a global is given on both sides, silently dropping the
+/// others.
+#[derive(Debug, Default, clap::Args)]
+struct VarArgs {
+    /// Set a variable for templated (`.sql.j2`) migrations. Repeatable.
+    ///
+    /// A plain key (`tier=prod`) sets `env.tier` for every migration; a
+    /// version-prefixed key (`20261106120000_cutoff=…`) sets `this.cutoff`
+    /// for that version only. Also read from `CHUM_VAR_<key>` environment
+    /// variables; `--var` wins for the same key.
+    #[arg(long = "var", value_name = "KEY=VALUE", value_parser = parse_var)]
+    vars: Vec<(String, String)>,
+}
+
+/// Parse a `--var` argument into its key and value, splitting at the first
+/// `=`. The key itself is validated later, together with `CHUM_VAR_*`.
+fn parse_var(arg: &str) -> Result<(String, String), String> {
+    arg.split_once('=')
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .ok_or_else(|| format!("expected KEY=VALUE, got {arg:?}"))
+}
+
+/// The prefix of the environment variables that supply template variables.
+const VAR_PREFIX: &str = "CHUM_VAR_";
+
+/// Collect `CHUM_VAR_<key>` variables as `(key, value)` pairs. The rest of the
+/// environment is never read, so it can't reach a template.
+fn env_vars(
+    environment: impl IntoIterator<Item = (OsString, OsString)>,
+) -> miette::Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for (name, value) in environment {
+        let Some(key) = name.to_str().and_then(|n| n.strip_prefix(VAR_PREFIX)) else {
+            continue;
+        };
+        let value = value
+            .into_string()
+            .map_err(|_| miette!("the value of {VAR_PREFIX}{key} is not valid UTF-8"))?;
+        out.push((key.to_owned(), value));
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Subcommand)]
@@ -417,9 +476,12 @@ enum Command {
         /// Stop after applying this version.
         #[arg(long)]
         target: Option<i64>,
-        /// Show the migrations that would be applied, without applying them.
+        /// Show the migrations that would be applied, and the variables each
+        /// would use, without applying them.
         #[arg(long)]
         dry_run: bool,
+        #[command(flatten)]
+        var: VarArgs,
     },
     /// Revert applied migrations. With no flag, reverts the most recently
     /// applied migration.
@@ -437,9 +499,33 @@ enum Command {
         /// Skip the confirmation prompt. Required to revert non-interactively.
         #[arg(long, short = 'y')]
         yes: bool,
+        #[command(flatten)]
+        var: VarArgs,
     },
     /// Show the state of every migration.
     Info,
+    /// Print the SQL migrations render to, without connecting to ClickHouse.
+    ///
+    /// Each migration is preceded by a comment naming its file, and the output
+    /// is valid SQL. Plain migrations are printed as they are. Variables come
+    /// from `--var` and `CHUM_VAR_*` only: recorded values aren't visible
+    /// offline, so `--down` shows what `revert` would run only when given the
+    /// values the up migration used. Fails exactly as `run` would on a missing
+    /// variable, a template error or a split error.
+    Render {
+        /// Render these versions. With neither versions nor `--from`, every
+        /// template in the source.
+        #[arg(conflicts_with = "from")]
+        versions: Vec<i64>,
+        /// Render every migration from this version on.
+        #[arg(long)]
+        from: Option<i64>,
+        /// Render the down migrations instead, newest first.
+        #[arg(long)]
+        down: bool,
+        #[command(flatten)]
+        var: VarArgs,
+    },
     /// Scaffold a new `up`/`down` migration pair in the source directory.
     Add {
         /// Short name (e.g. `add_users_table`).
@@ -451,6 +537,9 @@ enum Command {
         /// existing timestamp scheme.
         #[arg(long)]
         sequential: bool,
+        /// Scaffold `.sql.j2` templates instead of plain `.sql` files.
+        #[arg(long)]
+        template: bool,
     },
     /// Renumber every migration in the source directory to a numbering scheme.
     ///
@@ -467,23 +556,60 @@ enum Command {
         dry_run: bool,
     },
     /// Mark a version as applied without running it (clears a dirty state).
+    ///
+    /// A template is still rendered, without executing it, so the values it
+    /// uses are recorded; values recorded by the failed attempt take part.
     Force {
         /// The version to force.
         version: i64,
+        #[command(flatten)]
+        var: VarArgs,
     },
+    /// Make a dirty version pending again by deleting its bookkeeping rows.
+    ///
+    /// For an attempt that failed without changing anything, e.g. a guard that
+    /// rejected its inputs. Database objects are not touched: resetting asserts
+    /// that the attempt left nothing behind, or that it was cleaned up by hand.
+    Reset {
+        /// The dirty version to reset.
+        version: i64,
+        /// Skip the confirmation prompt. Required to reset non-interactively.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+impl Command {
+    /// The `--var` arguments given after the subcommand.
+    fn vars(&self) -> &[(String, String)] {
+        match self {
+            Command::Run { var, .. }
+            | Command::Revert { var, .. }
+            | Command::Render { var, .. }
+            | Command::Force { var, .. } => &var.vars,
+            Command::Info
+            | Command::Add { .. }
+            | Command::Convert { .. }
+            | Command::Reset { .. } => &[],
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    let cli = Cli::parse();
+    cli.color.apply();
+    install_error_renderer(cli.color);
+
+    // Logs go to stderr so they never mix with JSON/TSV output on stdout, and
+    // follow `--color` like everything else written there.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
+        .with_writer(std::io::stderr)
+        .with_ansi(console::colors_enabled_stderr())
         .init();
-
-    let cli = Cli::parse();
-    cli.color.apply();
-    install_error_renderer(cli.color);
 
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
@@ -520,26 +646,49 @@ async fn run(cli: Cli) -> miette::Result<()> {
     let fmt = cli.format.resolve(cli.json);
 
     // `add` and `convert` are purely local and need no database connection.
-    if let Command::Add { name, sequential } = &cli.command {
+    if let Command::Add {
+        name,
+        sequential,
+        template,
+    } = &cli.command
+    {
         let version = next_version(&cli.source, *sequential)?;
-        let (up, down) = source::scaffold(&cli.source, &version, name, false)?;
+        let (up, down) = source::scaffold(&cli.source, &version, name, *template)?;
         return render_add(&up, &down, fmt);
     }
     if let Command::Convert { to, dry_run } = &cli.command {
         return run_convert(&cli.source, *to, *dry_run, fmt);
     }
 
-    let migrator = Migrator::new(source::from_path(&cli.source)?);
+    let flags = cli.var.vars.iter().chain(cli.command.vars()).cloned();
+    let vars = Vars::from_keys(flags, env_vars(std::env::vars_os())?)?;
+    let migrator = Migrator::new(source::from_path(&cli.source)?).vars(vars);
+
+    // `render` is offline: it needs the source and variables, never a client.
+    if let Command::Render {
+        versions,
+        from,
+        down,
+        ..
+    } = &cli.command
+    {
+        return run_render(&migrator, versions, *from, *down, fmt);
+    }
+
     let client = build_client(&cli)?;
     let bookkeeping = chum::Bookkeeping::new(cli.bookkeeping_database.clone(), cli.table.clone())?;
     let bookkeeping = &bookkeeping;
 
     match cli.command {
-        Command::Run { target, dry_run } => {
+        Command::Run {
+            target, dry_run, ..
+        } => {
             if dry_run {
                 let planned = migrator.plan(&client, bookkeeping, target).await?;
+                warn_vars(&migrator);
                 render_plan(&planned, fmt)?;
             } else {
+                upgrade_bookkeeping(&client, bookkeeping).await?;
                 let pb = spinner("Applying pending migrations…");
                 let applied = migrator
                     .run_with(&client, bookkeeping, target, |event| {
@@ -553,6 +702,7 @@ async fn run(cli: Cli) -> miette::Result<()> {
                     })
                     .await?;
                 pb.finish_and_clear();
+                warn_vars(&migrator);
                 render_applied(&applied, fmt)?;
             }
         }
@@ -561,10 +711,12 @@ async fn run(cli: Cli) -> miette::Result<()> {
             steps,
             dry_run,
             yes,
+            ..
         } => {
             let target =
                 resolve_revert_target(&migrator, &client, bookkeeping, target, steps).await?;
             let versions = migrator.revert_plan(&client, bookkeeping, target).await?;
+            warn_vars(&migrator);
             if versions.is_empty() {
                 render_revert(&[], fmt, RevertPhase::Done)?;
             } else if dry_run {
@@ -579,6 +731,7 @@ async fn run(cli: Cli) -> miette::Result<()> {
                     yes,
                     fmt,
                 )? {
+                    upgrade_bookkeeping(&client, bookkeeping).await?;
                     let pb = spinner("Reverting migrations…");
                     let reverted = migrator
                         .undo_with(&client, bookkeeping, target, |event| {
@@ -600,15 +753,141 @@ async fn run(cli: Cli) -> miette::Result<()> {
             pb.finish_and_clear();
             render_info(&statuses, fmt)?;
         }
-        Command::Force { version } => {
+        Command::Force { version, .. } => {
+            upgrade_bookkeeping(&client, bookkeeping).await?;
             let pb = spinner(&format!("Forcing {version} as applied…"));
             migrator.force(&client, bookkeeping, version).await?;
             pb.finish_and_clear();
+            warn_vars(&migrator);
             render_force(version, fmt)?;
         }
-        Command::Add { .. } | Command::Convert { .. } => unreachable!("handled above"),
+        Command::Reset { version, yes } => {
+            chum::backend::ensure_database(&client, bookkeeping).await?;
+            chum::backend::ensure_table(&client, bookkeeping).await?;
+            let dirty = chum::backend::list_applied(&client, bookkeeping)
+                .await?
+                .iter()
+                .any(|m| m.version == version && !m.success);
+            // A version that isn't dirty goes straight to `reset`, which refuses
+            // it, so the user isn't asked to confirm something that can't happen.
+            let prompt = format!(
+                "Reset dirty version {version}? Its bookkeeping rows are deleted; database \
+                 objects are left as they are."
+            );
+            if dirty && !confirm(&prompt, yes, fmt)? {
+                if fmt == Resolved::Pretty {
+                    println!("{}", theme::muted().apply_to("aborted"));
+                }
+            } else {
+                migrator.reset(&client, bookkeeping, version).await?;
+                render_reset(version, fmt)?;
+            }
+        }
+        Command::Add { .. } | Command::Convert { .. } | Command::Render { .. } => {
+            unreachable!("handled above")
+        }
     }
     Ok(())
+}
+
+/// Create the bookkeeping database and table if missing and add the `vars`
+/// column to a table an older chum created, logging the upgrade so it shows up
+/// in deploy logs. Only commands that write markers call this.
+async fn upgrade_bookkeeping(
+    client: &clickhouse::Client,
+    bookkeeping: &chum::Bookkeeping,
+) -> miette::Result<()> {
+    chum::backend::ensure_database(client, bookkeeping).await?;
+    chum::backend::ensure_table(client, bookkeeping).await?;
+    if let Some(statement) = chum::backend::upgrade_table(client, bookkeeping).await? {
+        tracing::info!("upgraded the bookkeeping table: {statement}");
+    }
+    Ok(())
+}
+
+/// Log a warning for each supplied variable that no template refers to, each
+/// `--var` the command's renders didn't use, and each `env.*` value that
+/// differs from the one recorded for a version being reverted or forced.
+fn warn_vars(migrator: &Migrator) {
+    for notice in migrator.var_notices() {
+        match notice {
+            VarNotice::Unreferenced { key, supplied } => tracing::warn!(
+                "{} sets {}, which no template in the source refers to",
+                supplied.origin.describe(&supplied.key),
+                namespaced_for(&key),
+            ),
+            VarNotice::Unused { key, supplied } if supplied.origin == Origin::Flag => {
+                tracing::warn!(
+                    "{} sets {}, which no migration rendered by this command used",
+                    supplied.origin.describe(&supplied.key),
+                    namespaced_for(&key),
+                );
+            }
+            VarNotice::EnvChanged {
+                version,
+                name,
+                supplied,
+                recorded,
+            } => tracing::warn!(
+                "version {version} was applied with {name} = {recorded:?}; using the supplied \
+                 {supplied:?}"
+            ),
+            _ => {}
+        }
+    }
+}
+
+/// `env.tier`, or `this.cutoff of version 5`.
+fn namespaced_for(key: &chum::VarKey) -> String {
+    match key {
+        chum::VarKey::Env(_) => key.namespaced(),
+        chum::VarKey::This { version, .. } => format!("{} of version {version}", key.namespaced()),
+    }
+}
+
+/// `chum render`: pick the migrations, render them, and print them.
+fn run_render(
+    migrator: &Migrator,
+    versions: &[i64],
+    from: Option<i64>,
+    down: bool,
+    fmt: Resolved,
+) -> miette::Result<()> {
+    let direction = if down { Direction::Down } else { Direction::Up };
+    let selected: Vec<&chum::Migration> = if versions.is_empty() {
+        let mut selected: Vec<&chum::Migration> = migrator
+            .migrations()
+            .iter()
+            .filter(|m| m.direction == direction)
+            .filter(|m| match from {
+                Some(from) => m.version >= from,
+                None => m.template,
+            })
+            .collect();
+        if down {
+            selected.reverse();
+        }
+        selected
+    } else {
+        // Unknown versions are reported by `render_many`.
+        versions
+            .iter()
+            .filter_map(|v| {
+                migrator
+                    .migrations()
+                    .iter()
+                    .find(|m| m.version == *v && m.direction == direction)
+            })
+            .collect()
+    };
+    let wanted: Vec<i64> = if versions.is_empty() {
+        selected.iter().map(|m| m.version).collect()
+    } else {
+        versions.to_vec()
+    };
+    let rendered = migrator.render_many(&wanted, direction)?;
+    warn_vars(migrator);
+    render_rendered(&selected, &rendered, fmt)
 }
 
 // ---------------------------------------------------------------------------
@@ -625,6 +904,9 @@ struct StatusOut {
     state: &'static str,
     applied_at: Option<String>,
     execution_ms: Option<u64>,
+    vars: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    template_vars: BTreeSet<String>,
 }
 
 #[derive(Serialize)]
@@ -632,12 +914,35 @@ struct AppliedOut {
     version: i64,
     description: String,
     execution_ms: u128,
+    vars: BTreeMap<String, String>,
 }
 
 #[derive(Serialize)]
 struct PlanOut {
     version: i64,
     description: String,
+    vars: Vec<VarOut>,
+}
+
+#[derive(Serialize)]
+struct VarOut {
+    name: String,
+    value: Option<String>,
+    origin: &'static str,
+}
+
+#[derive(Serialize)]
+struct RenderOut {
+    version: i64,
+    direction: &'static str,
+    file: String,
+    statements: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ResetOut {
+    version: i64,
+    reset: bool,
 }
 
 #[derive(Serialize)]
@@ -687,14 +992,18 @@ fn render_info(statuses: &[chum::Status], fmt: Resolved) -> miette::Result<()> {
                 println!("{}", theme::muted().apply_to("no migrations found"));
                 return Ok(());
             }
+            // The column only appears once some version recorded variables.
+            let show_vars = statuses.iter().any(|s| !s.vars.is_empty());
             let mut builder = TableBuilder::new();
-            builder.push_record(header_row([
-                "Version",
-                "Description",
-                "State",
-                "Applied At",
-                "Took",
-            ]));
+            let mut header = vec!["Version", "Description", "State", "Applied At", "Took"];
+            if show_vars {
+                header.push("Vars");
+            }
+            builder.push_record(
+                header
+                    .into_iter()
+                    .map(|label| theme::heading().apply_to(label).to_string()),
+            );
             let (mut applied, mut pending, mut dirty) = (0u32, 0u32, 0u32);
             for s in statuses {
                 let state = match s.state {
@@ -715,13 +1024,19 @@ fn render_info(statuses: &[chum::Status], fmt: Resolved) -> miette::Result<()> {
                 let took = s
                     .execution_ms
                     .map_or_else(String::new, |ms| format!("{ms} ms"));
-                builder.push_record([
+                let mut row = vec![
                     theme::version().apply_to(s.version).to_string(),
                     s.description.clone(),
                     state.to_string(),
                     theme::muted().apply_to(when).to_string(),
                     theme::muted().apply_to(took).to_string(),
-                ]);
+                ];
+                if show_vars {
+                    let vars: Vec<String> =
+                        s.vars.iter().map(|(k, v)| format!("{k} = {v}")).collect();
+                    row.push(vars.join("\n"));
+                }
+                builder.push_record(row);
             }
             print_table(builder);
             println!(
@@ -740,6 +1055,8 @@ fn render_info(statuses: &[chum::Status], fmt: Resolved) -> miette::Result<()> {
                     state: state_str(s.state),
                     applied_at: s.applied_at.map(rfc3339),
                     execution_ms: s.execution_ms,
+                    vars: s.vars.clone(),
+                    template_vars: s.template_vars.clone(),
                 })
                 .collect();
             print_json(&out)?;
@@ -754,6 +1071,7 @@ fn render_info(statuses: &[chum::Status], fmt: Resolved) -> miette::Result<()> {
                         state_str(s.state).to_string(),
                         s.applied_at.map(rfc3339).unwrap_or_default(),
                         s.execution_ms.map(|ms| ms.to_string()).unwrap_or_default(),
+                        compact_json(&s.vars),
                     ]
                 })
                 .collect();
@@ -764,6 +1082,7 @@ fn render_info(statuses: &[chum::Status], fmt: Resolved) -> miette::Result<()> {
                     "state",
                     "applied_at",
                     "execution_ms",
+                    "vars",
                 ],
                 &rows,
             );
@@ -807,6 +1126,7 @@ fn render_applied(applied: &[chum::Applied], fmt: Resolved) -> miette::Result<()
                     version: a.version,
                     description: a.description.clone(),
                     execution_ms: a.elapsed.as_millis(),
+                    vars: a.vars.clone(),
                 })
                 .collect();
             print_json(&out)?;
@@ -836,11 +1156,27 @@ fn render_plan(planned: &[chum::Planned], fmt: Resolved) -> miette::Result<()> {
                 return Ok(());
             }
             let mut builder = TableBuilder::new();
-            builder.push_record(header_row(["Version", "Description"]));
+            builder.push_record(header_row(["Version", "Description", "Variables"]));
             for p in planned {
+                let vars: Vec<String> = p
+                    .vars
+                    .iter()
+                    .map(|v| {
+                        let value = v
+                            .value
+                            .as_deref()
+                            .map_or_else(|| "(unset)".to_owned(), |v| format!("{v:?}"));
+                        format!(
+                            "{} = {value} {}",
+                            v.name,
+                            theme::muted().apply_to(format!("({})", v.origin))
+                        )
+                    })
+                    .collect();
                 builder.push_record([
                     theme::version().apply_to(p.version).to_string(),
                     theme::pending().apply_to(&p.description).to_string(),
+                    vars.join("\n"),
                 ]);
             }
             print_table(builder);
@@ -858,6 +1194,7 @@ fn render_plan(planned: &[chum::Planned], fmt: Resolved) -> miette::Result<()> {
                 .map(|p| PlanOut {
                     version: p.version,
                     description: p.description.clone(),
+                    vars: var_outs(&p.vars),
                 })
                 .collect();
             print_json(&out)?;
@@ -865,12 +1202,34 @@ fn render_plan(planned: &[chum::Planned], fmt: Resolved) -> miette::Result<()> {
         Resolved::Tsv => {
             let rows: Vec<Vec<String>> = planned
                 .iter()
-                .map(|p| vec![p.version.to_string(), p.description.clone()])
+                .map(|p| {
+                    vec![
+                        p.version.to_string(),
+                        p.description.clone(),
+                        compact_json(&var_outs(&p.vars)),
+                    ]
+                })
                 .collect();
-            print_tsv(&["version", "description"], &rows);
+            print_tsv(&["version", "description", "vars"], &rows);
         }
     }
     Ok(())
+}
+
+fn var_outs(vars: &[chum::UsedVar]) -> Vec<VarOut> {
+    vars.iter()
+        .map(|v| VarOut {
+            name: v.name.clone(),
+            value: v.value.clone(),
+            origin: v.origin.as_str(),
+        })
+        .collect()
+}
+
+/// One-line JSON for a TSV cell. JSON escapes tabs and newlines, so the cell
+/// never breaks the row.
+fn compact_json<T: Serialize>(value: &T) -> String {
+    serde_json::to_string(value).expect("plain maps and lists serialize")
 }
 
 fn render_revert(versions: &[i64], fmt: Resolved, phase: RevertPhase) -> miette::Result<()> {
@@ -1026,6 +1385,72 @@ fn render_force(version: i64, fmt: Resolved) -> miette::Result<()> {
         ),
     }
     Ok(())
+}
+
+fn render_reset(version: i64, fmt: Resolved) -> miette::Result<()> {
+    match fmt {
+        Resolved::Pretty => println!(
+            "{} reset {}; it is pending again",
+            check(),
+            theme::version().apply_to(version),
+        ),
+        Resolved::Json => print_json(&ResetOut {
+            version,
+            reset: true,
+        })?,
+        Resolved::Tsv => print_tsv(
+            &["version", "reset"],
+            &[vec![version.to_string(), "true".into()]],
+        ),
+    }
+    Ok(())
+}
+
+/// Print rendered migrations. Anything but JSON prints SQL, whatever the
+/// format: each migration under a comment naming its file, each statement
+/// terminated so the whole output can be piped to a SQL client.
+fn render_rendered(
+    migrations: &[&chum::Migration],
+    rendered: &[Vec<String>],
+    fmt: Resolved,
+) -> miette::Result<()> {
+    if fmt == Resolved::Json {
+        let out: Vec<RenderOut> = migrations
+            .iter()
+            .zip(rendered)
+            .map(|(m, statements)| RenderOut {
+                version: m.version,
+                direction: m.direction.as_str(),
+                file: m.file_name.to_string(),
+                statements: statements.clone(),
+            })
+            .collect();
+        return print_json(&out);
+    }
+    print!("{}", sql_listing(migrations, rendered));
+    Ok(())
+}
+
+fn sql_listing(migrations: &[&chum::Migration], rendered: &[Vec<String>]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for (i, (m, statements)) in migrations.iter().zip(rendered).enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let _ = writeln!(out, "-- {}", m.file_name);
+        for (j, stmt) in statements.iter().enumerate() {
+            if j > 0 {
+                out.push('\n');
+            }
+            // A statement can end in a `--` comment, which would swallow a `;`
+            // on the same line.
+            let last_line = stmt.lines().last().unwrap_or_default();
+            let terminator = if last_line.contains("--") { "\n;" } else { ";" };
+            let _ = writeln!(out, "{stmt}{terminator}");
+        }
+    }
+    out
 }
 
 /// Build a [`clickhouse::Client`] from the connection URL and overrides.
@@ -1309,7 +1734,26 @@ fn run_convert(dir: &Path, to: Scheme, dry_run: bool, fmt: Resolved) -> miette::
     if !dry_run {
         rename_all(&plan)?;
     }
+    remind_about_version_keys(&files, &map);
     render_convert(&plan, to, dry_run, fmt)
+}
+
+/// Renumbering orphans version-prefixed variables (`CHUM_VAR_<version>_<name>`,
+/// `--var <version>_<name>`) in deploy specs, so warn about each renumbered
+/// template version.
+fn remind_about_version_keys(files: &[source::MigrationFile], map: &HashMap<i64, String>) {
+    let renumbered: BTreeMap<i64, &String> = files
+        .iter()
+        .filter(|f| f.template)
+        .map(|f| (f.version, &map[&f.version]))
+        .filter(|(old, new)| new.parse::<i64>().ok() != Some(*old))
+        .collect();
+    for (old, new) in renumbered {
+        tracing::warn!(
+            "version {old} of a template is now {new}: rename version-prefixed variables such as \
+             {VAR_PREFIX}{old}_<name> or --var {old}_<name> to use {new}"
+        );
+    }
 }
 
 /// Canonical sequential versions `0001..=n`, zero-padded wide enough for `n`
@@ -1591,5 +2035,108 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn convert_keeps_the_template_suffix() {
+        use std::fs;
+
+        let dir = std::env::temp_dir().join("chum-convert-template");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("mkdir");
+        for name in [
+            "20260101000000_first.up.sql.j2",
+            "20260101000000_first.down.sql",
+        ] {
+            fs::write(dir.join(name), "-- x\n").expect("write");
+        }
+        run_convert(&dir, Scheme::Sequential, false, Resolved::Tsv).expect("to sequential");
+        let mut names: Vec<String> = fs::read_dir(&dir)
+            .expect("readdir")
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["0001_first.down.sql", "0001_first.up.sql.j2"]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn var_flags_split_at_the_first_equals() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from([
+            "chum",
+            "--var",
+            "tier=prod",
+            "run",
+            "--var",
+            "20261106120000_cutoff=a=b",
+        ])
+        .expect("valid args parse");
+        let vars: Vec<_> = cli
+            .var
+            .vars
+            .iter()
+            .chain(cli.command.vars())
+            .cloned()
+            .collect();
+        assert_eq!(
+            vars,
+            [
+                ("tier".to_owned(), "prod".to_owned()),
+                ("20261106120000_cutoff".to_owned(), "a=b".to_owned())
+            ]
+        );
+        assert!(Cli::try_parse_from(["chum", "--var", "novalue", "run"]).is_err());
+    }
+
+    #[test]
+    fn only_chum_var_environment_variables_are_read() {
+        let env = [
+            ("CHUM_VAR_tier", "prod"),
+            ("CHUM_VAR_20261106120000_cutoff", "T"),
+            ("PATH", "/bin"),
+            ("CLICKHOUSE_URL", "http://x"),
+            ("CHUM_TABLE", "t"),
+        ]
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let vars = env_vars(env).expect("utf-8");
+        assert_eq!(
+            vars,
+            [
+                ("tier".to_owned(), "prod".to_owned()),
+                ("20261106120000_cutoff".to_owned(), "T".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn render_parses_versions_or_from() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from(["chum", "render", "1", "2", "--down"]).expect("versions");
+        assert!(matches!(
+            cli.command,
+            Command::Render { ref versions, from: None, down: true, .. } if versions == &[1, 2]
+        ));
+        assert!(Cli::try_parse_from(["chum", "render", "1", "--from", "1"]).is_err());
+    }
+
+    #[test]
+    fn sql_listing_terminates_every_statement() {
+        let a = chum::Migration::new(1, "a", Direction::Up, "").with_template(true);
+        let b = chum::Migration::new(2, "b", Direction::Up, "");
+        let listing = sql_listing(
+            &[&a, &b],
+            &[
+                vec!["SELECT 1".into(), "SELECT 2 -- trailing".into()],
+                vec!["SELECT 3".into()],
+            ],
+        );
+        assert_eq!(
+            listing,
+            "-- 1_a.up.sql.j2\nSELECT 1;\n\nSELECT 2 -- trailing\n;\n\n-- 2_b.up.sql\nSELECT 3;\n"
+        );
+        let statements = chum::split::split_statements(&listing).expect("valid SQL");
+        assert_eq!(statements.len(), 3);
     }
 }

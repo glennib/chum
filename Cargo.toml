@@ -33,7 +33,7 @@ template = ["dep:minijinja"]
 # of these; a consumer that only uses the library can disable default features.
 # Enables `diagnostic` so the binary's `?` carries the library's rich error
 # diagnostics, and `miette/fancy` for the graphical terminal renderer.
-cli = ["diagnostic", "template", "miette/fancy", "dep:clap", "dep:console", "dep:indicatif", "dep:percent-encoding", "dep:serde_json", "dep:tabled", "dep:tokio", "dep:tracing-subscriber", "dep:url"]
+cli = ["diagnostic", "template", "miette/fancy", "dep:clap", "dep:console", "dep:indicatif", "dep:percent-encoding", "dep:serde_json", "dep:tabled", "dep:tokio", "dep:tracing", "dep:tracing-subscriber", "dep:url"]
 
 [dependencies]
 # Library dependencies.
@@ -63,6 +63,7 @@ percent-encoding = { version = "2", optional = true }
 serde_json = { version = "1", optional = true }
 tabled = { version = "0.22", features = ["ansi"], optional = true }
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread"], optional = true }
+tracing = { version = "0.1", default-features = false, features = ["std"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
 url = { version = "2", optional = true }
 
