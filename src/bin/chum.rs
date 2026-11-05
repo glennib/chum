@@ -567,9 +567,10 @@ enum Command {
     },
     /// Make a dirty version pending again by deleting its bookkeeping rows.
     ///
-    /// For an attempt that failed without changing anything, e.g. a guard that
-    /// rejected its inputs. Database objects are not touched: resetting asserts
-    /// that the attempt left nothing behind, or that it was cleaned up by hand.
+    /// For an apply that failed without changing anything, e.g. a guard that
+    /// rejected its inputs, or a revert that failed partway and was finished by
+    /// hand. Database objects are not touched: resetting asserts that the
+    /// version's objects are gone.
     Reset {
         /// The dirty version to reset.
         version: i64,

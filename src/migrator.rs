@@ -51,7 +51,7 @@ pub enum State {
     Applied,
     /// Present in the source but not yet applied.
     Pending,
-    /// A previous apply failed partway; the version is dirty.
+    /// A previous apply or revert failed partway; the version is dirty.
     Dirty,
 }
 
@@ -457,9 +457,10 @@ impl Migrator {
         let prepared = self.prepare_reverts(&applied, target)?;
 
         let mut reverted = Vec::new();
-        for p in prepared {
+        for (rec, p) in prepared {
             let version = p.migration.version;
             on_progress(Progress::RevertStarted { version });
+            backend::record_revert_started(client, bookkeeping, rec).await?;
             for stmt in &p.statements {
                 // `query` would treat any `?` as a bind placeholder.
                 client.query_raw(stmt).execute().await?;
@@ -493,17 +494,17 @@ impl Migrator {
         Ok(self
             .prepare_reverts(&applied, target)?
             .into_iter()
-            .map(|p| p.migration.version)
+            .map(|(_, p)| p.migration.version)
             .collect())
     }
 
     /// Render and split the down migration of every applied version above
-    /// `target`, newest first.
+    /// `target`, newest first, each paired with its recorded state.
     fn prepare_reverts<'a>(
         &'a self,
         applied: &'a HashMap<i64, AppliedMigration>,
         target: i64,
-    ) -> Result<Vec<Prepared<'a>>> {
+    ) -> Result<Vec<(&'a AppliedMigration, Prepared<'a>)>> {
         let mut versions: Vec<&AppliedMigration> = applied
             .values()
             .filter(|m| m.success && m.version > target)
@@ -511,7 +512,7 @@ impl Migrator {
         versions.sort_unstable_by_key(|m| std::cmp::Reverse(m.version));
 
         let mut downs = Vec::with_capacity(versions.len());
-        for rec in versions {
+        for rec in &versions {
             let down = self.down(rec.version).ok_or_else(|| {
                 ChumError::Source(format!(
                     "no down migration for applied version {}",
@@ -520,7 +521,7 @@ impl Migrator {
             })?;
             downs.push((down, Some(&rec.vars)));
         }
-        self.prepare(downs)
+        Ok(versions.into_iter().zip(self.prepare(downs)?).collect())
     }
 
     /// Record a version as successfully applied **without running its SQL**,
@@ -557,7 +558,8 @@ impl Migrator {
     /// pending again and the next [`Migrator::run`] applies it afresh.
     ///
     /// The database objects are not touched: the caller asserts that the
-    /// failed attempt left nothing behind, or has cleaned up by hand.
+    /// version's objects are gone, because a failed apply left nothing behind,
+    /// or a failed revert was finished by hand.
     ///
     /// # Errors
     ///
@@ -729,10 +731,13 @@ impl Migrator {
         if let Some(dirty) = applied
             .iter()
             .filter(|m| !m.success)
-            .map(|m| m.version)
-            .min()
+            .min_by_key(|m| m.version)
         {
-            return Err(ChumError::Dirty(dirty));
+            return Err(if dirty.reverting {
+                ChumError::DirtyRevert(dirty.version)
+            } else {
+                ChumError::Dirty(dirty.version)
+            });
         }
 
         if !self.ignore_missing {

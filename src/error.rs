@@ -104,6 +104,25 @@ pub enum ChumError {
     )]
     Dirty(i64),
 
+    /// The database is dirty because reverting a version failed partway: its
+    /// down migration ran only in part.
+    #[error(
+        "database is dirty at version {0}: reverting it failed partway; finish the revert and \
+         run `chum reset {0}`, or restore the version and run `chum force {0}`"
+    )]
+    #[cfg_attr(
+        feature = "diagnostic",
+        diagnostic(
+            code(chum::dirty_revert),
+            help(
+                "Both commands only update chum's bookkeeping. `chum reset <version>` records the \
+                 version as reverted, so the next `chum run` applies it again; `chum force \
+                 <version>` records it as applied. Make the schema match before running either."
+            )
+        )
+    )]
+    DirtyRevert(i64),
+
     /// A ClickHouse query failed.
     #[error("clickhouse error: {0}")]
     #[cfg_attr(

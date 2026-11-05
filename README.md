@@ -505,7 +505,10 @@ counter (this also leaves a full audit trail of every attempt). If an apply
 fails partway, the latest marker stays `false` and the version reads as
 **dirty** until resolved (fix the schema by hand, then `chum force <version>`;
 or, if the attempt changed nothing, `chum reset <version>` to make it pending
-again).
+again). A revert likewise writes a `success = false` marker before running the
+down migration and deletes the version's rows once it finishes, so a revert that
+fails partway also leaves the version dirty. Finish the revert by hand and run
+`chum reset <version>`, or restore the version and run `chum force <version>`.
 
 Each marker also records, in a `vars Map(String, String)` column, the template
 variables the migration used (see

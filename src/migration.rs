@@ -146,8 +146,12 @@ pub struct AppliedMigration {
     /// When the latest marker for this version was recorded.
     pub applied_at: chrono::DateTime<chrono::Utc>,
     /// Whether the migration completed successfully. A `false` value marks
-    /// the version as *dirty* (a partial / failed apply).
+    /// the version as *dirty* (a partial / failed apply or revert).
     pub success: bool,
+    /// Whether the version is dirty because reverting it failed partway, as
+    /// opposed to applying it. Always `false` when [`success`](Self::success)
+    /// is `true`.
+    pub reverting: bool,
     /// The variables the latest marker recorded, keyed by namespaced name
     /// (`env.tier`, `this.cutoff`). Empty for plain migrations and for rows
     /// written before chum recorded variables.

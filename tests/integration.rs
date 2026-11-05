@@ -733,6 +733,96 @@ async fn a_failed_guard_is_cleared_with_reset() {
     template_teardown(&admin, &[app_db, bookkeeping_db, log_db]).await;
 }
 
+#[tokio::test]
+#[ignore = "requires a running ClickHouse (mise run db:up)"]
+async fn failed_statements_leave_the_version_dirty() {
+    use chum::ChumError;
+    use chum::Direction;
+    use chum::Migration;
+
+    let admin = client("default");
+    let (bookkeeping_db, app_db) = ("chum_it_failed_stmt_bk", "chum_it_failed_stmt_app");
+    let drop_databases = async || {
+        for db in [app_db, bookkeeping_db] {
+            exec(&admin, &format!("DROP DATABASE IF EXISTS {db}")).await;
+        }
+    };
+    drop_databases().await;
+    let db = unpinned_client();
+    let bookkeeping = Bookkeeping::new(bookkeeping_db, TABLE).expect("valid bookkeeping");
+    let migration = |version, direction, sql: String| Migration::new(version, "m", direction, sql);
+    let base = |down: &str| {
+        vec![
+            migration(
+                1,
+                Direction::Up,
+                format!(
+                    "CREATE DATABASE {app_db}; CREATE TABLE {app_db}.a (x UInt8) ENGINE = Memory"
+                ),
+            ),
+            migration(1, Direction::Down, down.to_owned()),
+        ]
+    };
+    let good_down = format!("DROP TABLE {app_db}.a; DROP DATABASE {app_db}");
+    let bad_down = format!("DROP TABLE {app_db}.a; DROP TABLE {app_db}.missing");
+    let mut failing_up = base(&good_down);
+    failing_up.push(migration(
+        2,
+        Direction::Up,
+        format!(
+            "CREATE TABLE {app_db}.b (x UInt8) ENGINE = Memory;\n-- guard\nSELECT throwIf(1, \
+             'boom')"
+        ),
+    ));
+
+    // An apply that fails at its second statement.
+    let err = Migrator::new(failing_up.clone())
+        .run(&db, &bookkeeping, None)
+        .await
+        .expect_err("throwIf");
+    assert!(matches!(err, ChumError::ClickHouse(_)), "{err}");
+    let err = Migrator::new(failing_up)
+        .run(&db, &bookkeeping, None)
+        .await
+        .expect_err("dirty");
+    assert!(matches!(err, ChumError::Dirty(2)), "{err}");
+    exec(&admin, &format!("DROP TABLE {app_db}.b")).await;
+    let migrator = Migrator::new(base(&bad_down));
+    migrator.reset(&db, &bookkeeping, 2).await.expect("reset");
+
+    // A revert that fails at its second statement reads as dirty, not applied.
+    let err = migrator
+        .undo(&db, &bookkeeping, 0)
+        .await
+        .expect_err("missing table");
+    assert!(matches!(err, ChumError::ClickHouse(_)), "{err}");
+    let statuses = migrator.info(&db, &bookkeeping).await.expect("info");
+    assert_eq!(statuses[0].state, State::Dirty);
+    let err = migrator
+        .undo(&db, &bookkeeping, 0)
+        .await
+        .expect_err("dirty");
+    assert!(matches!(err, ChumError::DirtyRevert(1)), "{err}");
+
+    // Restoring the version by hand and forcing it makes it revertable again.
+    exec(
+        &admin,
+        &format!("CREATE TABLE {app_db}.a (x UInt8) ENGINE = Memory"),
+    )
+    .await;
+    migrator.force(&db, &bookkeeping, 1).await.expect("force");
+    let migrator = Migrator::new(base(&good_down));
+    assert_eq!(
+        migrator.undo(&db, &bookkeeping, 0).await.expect("undo"),
+        [1]
+    );
+    assert!(!database_exists(&admin, app_db).await);
+    let statuses = migrator.info(&db, &bookkeeping).await.expect("info");
+    assert_eq!(statuses[0].state, State::Pending);
+
+    drop_databases().await;
+}
+
 /// `max_version` scans filenames only (no ClickHouse), so this runs in the
 /// default test flow. It exercises the seam the `add` command uses to continue
 /// a sequential scheme: a missing dir, an empty dir, and the highest version

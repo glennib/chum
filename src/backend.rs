@@ -149,6 +149,7 @@ struct AppliedRow {
     #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
     applied_at: chrono::DateTime<chrono::Utc>,
     success: bool,
+    succeeded_before: bool,
     vars: Vec<(String, String)>,
 }
 
@@ -267,6 +268,10 @@ pub async fn upgrade_table(
 /// A table without the `vars` column reads every version's variables as
 /// empty.
 ///
+/// A dirty version with an earlier `success = true` marker reads as
+/// [`reverting`](AppliedMigration::reverting): only a revert appends a `false`
+/// marker after a `true` one, since `run` only applies versions with no rows.
+///
 /// # Errors
 ///
 /// Returns [`ChumError::ClickHouse`] if the query fails.
@@ -280,6 +285,8 @@ pub async fn list_applied(
     } else {
         "CAST(map(), 'Map(String, String)')"
     };
+    // `bk.success` names the column: a bare `success` inside `max` resolves to
+    // the `argMax` alias, which ClickHouse rejects as a nested aggregate.
     let sql = format!(
         "SELECT version,
                 argMax(description, seq)  AS description,
@@ -287,8 +294,9 @@ pub async fn list_applied(
                 argMax(execution_ms, seq) AS execution_ms,
                 argMax(applied_at, seq)   AS applied_at,
                 argMax(success, seq)      AS success,
+                max(bk.success)           AS succeeded_before,
                 {vars}                    AS vars
-         FROM {table}
+         FROM {table} AS bk
          GROUP BY version
          ORDER BY version"
     );
@@ -302,6 +310,7 @@ pub async fn list_applied(
             execution_ms: r.execution_ms,
             applied_at: r.applied_at,
             success: r.success,
+            reverting: !r.success && r.succeeded_before,
             vars: r.vars.into_iter().collect(),
         })
         .collect())
@@ -325,6 +334,55 @@ pub async fn record(
     success: bool,
     vars: &BTreeMap<String, String>,
 ) -> Result<()> {
+    let marker = Marker {
+        version: migration.version,
+        description: &migration.description,
+        checksum: &migration.checksum,
+        execution_ms,
+        success,
+        vars,
+    };
+    insert_marker(client, bookkeeping, &marker).await
+}
+
+/// Append a `success = false` marker for an applied version that is about to
+/// be reverted, so it reads as dirty if the revert fails partway. The marker
+/// repeats what `applied` recorded, so a later `force` restores it as applied.
+///
+/// # Errors
+///
+/// Returns [`ChumError::ClickHouse`] if the insert fails.
+pub(crate) async fn record_revert_started(
+    client: &clickhouse::Client,
+    bookkeeping: &Bookkeeping,
+    applied: &AppliedMigration,
+) -> Result<()> {
+    let marker = Marker {
+        version: applied.version,
+        description: &applied.description,
+        checksum: &applied.checksum,
+        execution_ms: 0,
+        success: false,
+        vars: &applied.vars,
+    };
+    insert_marker(client, bookkeeping, &marker).await
+}
+
+/// One bookkeeping row to append.
+struct Marker<'a> {
+    version: i64,
+    description: &'a str,
+    checksum: &'a str,
+    execution_ms: u64,
+    success: bool,
+    vars: &'a BTreeMap<String, String>,
+}
+
+async fn insert_marker(
+    client: &clickhouse::Client,
+    bookkeeping: &Bookkeeping,
+    marker: &Marker<'_>,
+) -> Result<()> {
     let table = bookkeeping.qualified();
     let sql = format!(
         "INSERT INTO {table}
@@ -332,15 +390,18 @@ pub async fn record(
          SELECT ?, ?, ?, ?, ?, toUnixTimestamp64Nano(now64(9)),
                 CAST(mapFromArrays(?, ?), 'Map(String, String)')"
     );
-    let (keys, values): (Vec<&str>, Vec<&str>) =
-        vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).unzip();
+    let (keys, values): (Vec<&str>, Vec<&str>) = marker
+        .vars
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .unzip();
     client
         .query(&sql)
-        .bind(migration.version)
-        .bind(migration.description.as_ref())
-        .bind(migration.checksum.as_ref())
-        .bind(execution_ms)
-        .bind(success)
+        .bind(marker.version)
+        .bind(marker.description)
+        .bind(marker.checksum)
+        .bind(marker.execution_ms)
+        .bind(marker.success)
         .bind(keys)
         .bind(values)
         .execute()
