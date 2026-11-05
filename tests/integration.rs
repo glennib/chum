@@ -9,10 +9,10 @@
 //! # or: cargo test -- --ignored
 //! ```
 //!
-//! The tests embed `tests/migrations/` and `tests/bootstrap_migrations/`
-//! (small, generic schemas) via `include_dir`, exercising the compile-time
-//! embedding front-end, and run the full apply → idempotent re-run → info →
-//! revert cycle.
+//! The tests embed `tests/migrations/`, `tests/bootstrap_migrations/` and
+//! `tests/question_mark_migrations/` (small, generic schemas) via
+//! `include_dir`, exercising the compile-time embedding front-end, and run the
+//! full apply → idempotent re-run → info → revert cycle.
 //!
 //! The compose file (`compose.yaml`) publishes ClickHouse on host port **8124**
 //! (not the default 8123) so it never collides with another project's
@@ -38,6 +38,10 @@ static BOOTSTRAP_MIGRATIONS: Dir = include_dir!("$CARGO_MANIFEST_DIR/tests/boots
 /// `IF NOT EXISTS`).
 static BOOTSTRAP_MIGRATIONS_OVERRIDE: Dir =
     include_dir!("$CARGO_MANIFEST_DIR/tests/bootstrap_migrations_override");
+
+/// Migrations whose SQL contains `?` and `??` in string literals and comments.
+static QUESTION_MARK_MIGRATIONS: Dir =
+    include_dir!("$CARGO_MANIFEST_DIR/tests/question_mark_migrations");
 
 const TEST_DB: &str = "chum_integration_test";
 const TABLE: &str = "_chum_migrations";
@@ -334,6 +338,47 @@ async fn bookkeeping_database_override_is_honored() {
         .expect("undo");
     exec(&admin, &format!("DROP DATABASE IF EXISTS {override_db}")).await;
     exec(&admin, &format!("DROP DATABASE IF EXISTS {app_db}")).await;
+}
+
+/// Migration SQL reaches ClickHouse verbatim: a `?` in a string literal or a
+/// comment is not a bind placeholder, and `??` is not unescaped to `?`, in
+/// both the up and the down direction.
+#[tokio::test]
+#[ignore = "requires a running ClickHouse (mise run db:up)"]
+async fn question_marks_in_migration_sql_are_sent_verbatim() {
+    let admin = client("default");
+    let bookkeeping_db = "chum_it_question_mark_bk";
+    let app_db = "chum_question_mark_app";
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {app_db}")).await;
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {bookkeeping_db}")).await;
+
+    let db = unpinned_client();
+    let bookkeeping = Bookkeeping::new(bookkeeping_db, TABLE).expect("valid bookkeeping");
+    let migrator =
+        Migrator::new(source::from_dir(&QUESTION_MARK_MIGRATIONS).expect("embedded migrations"));
+
+    let applied = migrator.run(&db, &bookkeeping, None).await.expect("run");
+    assert_eq!(applied.len(), 1, "one migration applied");
+
+    let stored: Vec<String> = admin
+        .query_raw(&format!("SELECT s FROM {app_db}.t ORDER BY id"))
+        .fetch_all()
+        .await
+        .expect("read stored values");
+    assert_eq!(stored, ["a?b", "??"]);
+
+    let reverted = migrator
+        .undo(&db, &bookkeeping, i64::MIN)
+        .await
+        .expect("undo");
+    assert_eq!(reverted.len(), 1);
+    assert!(
+        !database_exists(&admin, app_db).await,
+        "revert dropped the app database"
+    );
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {bookkeeping_db}")).await;
 }
 
 /// `max_version` scans filenames only (no ClickHouse), so this runs in the

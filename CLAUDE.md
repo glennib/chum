@@ -18,10 +18,12 @@ manual and the rationale.
   colliding with another project's ClickHouse), then `cargo nextest run
   --run-ignored all` (the tests default `CLICKHOUSE_URL` to
   `http://localhost:8124`). They embed `tests/migrations/`,
-  `tests/bootstrap_migrations/`, and `tests/bootstrap_migrations_override/` and
-  cover: the full apply → re-run → info → revert cycle with bookkeeping in a
-  dedicated database; a migration that creates its **own** database with the app
-  db not pre-existing; and the `--bookkeeping-database` override.
+  `tests/bootstrap_migrations/`, `tests/bootstrap_migrations_override/`, and
+  `tests/question_mark_migrations/` and cover: the full apply → re-run → info →
+  revert cycle with bookkeeping in a dedicated database; a migration that
+  creates its **own** database with the app db not pre-existing; the
+  `--bookkeeping-database` override; and `?` / `??` in migration SQL reaching
+  ClickHouse verbatim.
 - **Final pre-commit check**: `mise run ci` — runs `fmt:check`, `clippy`,
   `clippy:lib`, `test`, `build:debug`, and `build:lib`. Run it after
   implementing changes and before committing; a green `mise run ci` is the bar

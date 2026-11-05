@@ -311,7 +311,8 @@ impl Migrator {
                 .map_err(|message| ChumError::Split { version, message })?;
             on_progress(Progress::RevertStarted { version });
             for stmt in &statements {
-                client.query(stmt).execute().await?;
+                // `query` would treat any `?` as a bind placeholder.
+                client.query_raw(stmt).execute().await?;
             }
             backend::delete_version(client, bookkeeping, version).await?;
             on_progress(Progress::RevertFinished { version });
@@ -485,7 +486,8 @@ impl Migrator {
 
         let start = Instant::now();
         for stmt in &statements {
-            client.query(stmt).execute().await?;
+            // `query` would treat any `?` as a bind placeholder.
+            client.query_raw(stmt).execute().await?;
         }
         let elapsed = start.elapsed();
 
