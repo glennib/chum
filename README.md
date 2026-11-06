@@ -103,8 +103,10 @@ keeps the file recognisable as SQL to editors and linters. Use a template for
 SQL that differs between environments (a `GRANT` only in production, a
 retention period) or that needs a value only known at apply time (a backfill
 cutoff). Plain `.sql` files behave exactly as before. `chum add --template
-<name>` scaffolds a template pair, and a template up with a plain down (or the
-reverse) is fine; two files for the same version and direction (plain and
+<name>` scaffolds a template pair, spelled like the newest template in the
+directory (`.sql.j2` when there is none); `--template-ext sql.j2|j2.sql` picks
+the spelling explicitly. A template up with a plain down (or the reverse) is
+fine; two files for the same version and direction (plain and
 template, or both template spellings) are an error.
 
 ```sql
@@ -320,7 +322,8 @@ chum revert --dry-run          # show what would be reverted, without reverting
 chum revert --steps 2 --yes    # revert without the confirmation prompt
 chum add add_users_table       # scaffold an up/down pair (continues the dir's scheme; timestamp by default)
 chum add --sequential initial  # start a fresh dir with sequential numbers (0001, 0002, …)
-chum add --template backfill   # scaffold a .sql.j2 template pair instead of plain .sql
+chum add --template backfill   # scaffold a template pair instead of plain .sql (continues the dir's spelling; .sql.j2 by default)
+chum add --template-ext j2.sql backfill  # scaffold a .j2.sql template pair, whatever the dir uses
 chum render --var tier=prod    # print the SQL every template renders to (offline)
 chum render --from 20260626 --down  # print the down SQL from a version on, newest first
 chum convert sequential        # renumber every migration to 0001, 0002, … (renames files)

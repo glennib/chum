@@ -312,6 +312,28 @@ pub fn migration_files(dir: &Path) -> Result<Vec<MigrationFile>> {
     Ok(files)
 }
 
+/// The extension style of the newest template in `dir` (highest version, its
+/// `down` file breaking a tie), or `None` when `dir` holds no templates or does
+/// not exist yet.
+///
+/// Used by the `add` command to continue the spelling a directory already uses.
+///
+/// # Errors
+///
+/// Returns [`ChumError::Source`] if the directory exists but cannot be read, or
+/// [`ChumError::Io`] if a directory entry cannot be inspected.
+pub fn newest_template_style(dir: &Path) -> Result<Option<TemplateStyle>> {
+    if let Err(e) = std::fs::metadata(dir)
+        && e.kind() == std::io::ErrorKind::NotFound
+    {
+        return Ok(None);
+    }
+    Ok(migration_files(dir)?
+        .into_iter()
+        .rev()
+        .find_map(|f| f.template))
+}
+
 /// Scaffold an empty `up`/`down` migration pair in `dir`, as templates spelled
 /// in the given style when `template` is set.
 ///
@@ -483,6 +505,32 @@ mod tests {
         let dir = write_dir("notpl", &["0001_x.up.sql.j2"]);
         let err = from_path(&dir).unwrap_err();
         assert!(matches!(err, ChumError::TemplatingDisabled(_)), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn newest_template_style_follows_the_highest_version() {
+        let missing = std::env::temp_dir().join("chum-source-style-missing");
+        let _ = std::fs::remove_dir_all(&missing);
+        assert_eq!(newest_template_style(&missing).unwrap(), None);
+
+        let dir = write_dir("style-plain", &["0001_a.up.sql", "0001_a.down.sql"]);
+        assert_eq!(newest_template_style(&dir).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = write_dir(
+            "style-mixed",
+            &[
+                "0001_a.up.j2.sql",
+                "0002_b.up.sql.j2",
+                "0002_b.down.j2.sql",
+                "0003_c.up.sql",
+            ],
+        );
+        assert_eq!(
+            newest_template_style(&dir).unwrap(),
+            Some(TemplateStyle::J2Sql)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

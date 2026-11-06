@@ -248,6 +248,26 @@ impl Scheme {
     }
 }
 
+/// A template extension spelling for `add --template-ext`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TemplateExt {
+    /// `<version>_<name>.up.sql.j2`.
+    #[value(name = "sql.j2")]
+    SqlJ2,
+    /// `<version>_<name>.up.j2.sql`.
+    #[value(name = "j2.sql")]
+    J2Sql,
+}
+
+impl From<TemplateExt> for source::TemplateStyle {
+    fn from(ext: TemplateExt) -> Self {
+        match ext {
+            TemplateExt::SqlJ2 => source::TemplateStyle::SqlJ2,
+            TemplateExt::J2Sql => source::TemplateStyle::J2Sql,
+        }
+    }
+}
+
 /// The scheme a single version belongs to, by the same [`TIMESTAMP_FLOOR`]
 /// boundary the `add` command uses to auto-detect.
 fn scheme_of(version: i64) -> Scheme {
@@ -538,9 +558,15 @@ enum Command {
         /// existing timestamp scheme.
         #[arg(long)]
         sequential: bool,
-        /// Scaffold `.sql.j2` templates instead of plain `.sql` files.
+        /// Scaffold templates instead of plain `.sql` files, spelled like the
+        /// newest template already in the source directory (`.sql.j2` when
+        /// there is none).
         #[arg(long)]
         template: bool,
+        /// Spell the templates' extension `sql.j2` or `j2.sql`, whatever the
+        /// existing templates use. Implies `--template`.
+        #[arg(long, value_enum, value_name = "EXT")]
+        template_ext: Option<TemplateExt>,
     },
     /// Renumber every migration in the source directory to a numbering scheme.
     ///
@@ -652,10 +678,15 @@ async fn run(cli: Cli) -> miette::Result<()> {
         name,
         sequential,
         template,
+        template_ext,
     } = &cli.command
     {
         let version = next_version(&cli.source, *sequential)?;
-        let style = template.then_some(source::TemplateStyle::SqlJ2);
+        let style = match (template_ext, template) {
+            (Some(ext), _) => Some((*ext).into()),
+            (None, true) => Some(source::newest_template_style(&cli.source)?.unwrap_or_default()),
+            (None, false) => None,
+        };
         let (up, down) = source::scaffold(&cli.source, &version, name, style)?;
         return render_add(&up, &down, fmt);
     }
@@ -2072,6 +2103,27 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn template_ext_takes_a_value_before_the_name() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from(["chum", "add", "--template-ext", "j2.sql", "backfill"])
+            .expect("valid args parse");
+        let Command::Add {
+            name,
+            template,
+            template_ext,
+            ..
+        } = cli.command
+        else {
+            panic!("expected add");
+        };
+        assert_eq!(name, "backfill");
+        assert!(!template);
+        assert_eq!(template_ext, Some(TemplateExt::J2Sql));
+
+        assert!(Cli::try_parse_from(["chum", "add", "--template-ext", "j2", "x"]).is_err());
     }
 
     #[test]
