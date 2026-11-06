@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/glennib/chum/compare/v0.3.0...v0.4.0) - 2026-11-06
+
+### Added
+
+- *(add)* continue the directory's template spelling
+- [**breaking**] accept `.j2.sql` as a template extension
+
 ## [0.3.0](https://github.com/glennib/chum/compare/v0.2.5...v0.3.0) - 2026-11-05
 
 ### Added
