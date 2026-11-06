@@ -62,7 +62,7 @@ pub struct Migration {
     /// it covers the template text, so every environment records the same
     /// checksum whatever it rendered.
     pub checksum: Cow<'static, str>,
-    /// Whether the file is a `.sql.j2` template, rendered with the supplied
+    /// Whether the file is a `.sql.j2` or `.j2.sql` template, rendered with the supplied
     /// variables before it runs.
     pub template: bool,
     /// The file name, used in render errors and `chum render` headers.
@@ -124,7 +124,9 @@ impl Migration {
     }
 }
 
-/// The extra suffix that marks a migration file as a template.
+/// The suffix [`Migration::with_template`] appends to a derived file name.
+/// Files on disk may also be spelled `.j2.sql`; see
+/// [`crate::source::TemplateStyle`].
 pub const TEMPLATE_SUFFIX: &str = ".j2";
 
 /// A migration that has been recorded in the database bookkeeping table.

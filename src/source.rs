@@ -7,8 +7,9 @@
 //!   library consumers that embed their own migrations in their binary.
 //!
 //! A file ending in `.up.sql` or `.down.sql` is a plain migration; one ending
-//! in `.up.sql.j2` or `.down.sql.j2` is a template, rendered with the
-//! supplied variables before it runs. Without the `template` feature, a
+//! in `.up.sql.j2` or `.down.sql.j2` (or, equally, `.up.j2.sql` or
+//! `.down.j2.sql`) is a template, rendered with the supplied variables before
+//! it runs. Without the `template` feature, a
 //! source containing a template fails to load rather than skipping it.
 //!
 //! A future `migrate!` proc-macro would be a third front-end emitting
@@ -27,7 +28,34 @@ use crate::error::ChumError;
 use crate::error::Result;
 use crate::migration::Direction;
 use crate::migration::Migration;
-use crate::migration::TEMPLATE_SUFFIX;
+
+/// How a template migration's extension is spelled. Both spellings load the
+/// same way; the style only matters when chum writes or renames a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TemplateStyle {
+    /// `.sql.j2`, e.g. `0001_x.up.sql.j2`.
+    #[default]
+    SqlJ2,
+    /// `.j2.sql`, e.g. `0001_x.up.j2.sql`.
+    J2Sql,
+}
+
+impl TemplateStyle {
+    /// The file extension, with its leading dot: `.sql.j2` or `.j2.sql`.
+    #[must_use]
+    pub fn extension(self) -> &'static str {
+        match self {
+            TemplateStyle::SqlJ2 => ".sql.j2",
+            TemplateStyle::J2Sql => ".j2.sql",
+        }
+    }
+}
+
+/// The filename suffix after `<version>_<name>`: `.up.sql`, `.down.j2.sql`, …
+fn suffix(direction: Direction, template: Option<TemplateStyle>) -> String {
+    let extension = template.map_or(".sql", TemplateStyle::extension);
+    format!(".{}{extension}", direction.as_str())
+}
 
 /// A migration filename, parsed.
 #[derive(Debug, PartialEq, Eq)]
@@ -36,7 +64,7 @@ struct Parsed {
     /// The `<name>` segment with its underscores intact.
     name: String,
     direction: Direction,
-    template: bool,
+    template: Option<TemplateStyle>,
 }
 
 impl Parsed {
@@ -47,23 +75,18 @@ impl Parsed {
 }
 
 /// Parse a migration filename of the form
-/// `<version>_<name>.{up,down}.sql[.j2]`.
+/// `<version>_<name>.{up,down}.{sql,sql.j2,j2.sql}`.
 ///
 /// Returns `None` for any filename that does not match (such files are
 /// ignored, matching sqlx / golang-migrate behavior).
 fn parse(file_name: &str) -> Option<Parsed> {
-    let (stem, template) = match file_name.strip_suffix(TEMPLATE_SUFFIX) {
-        Some(stem) => (stem, true),
-        None => (file_name, false),
-    };
-    let (rest, direction) = if let Some(rest) = stem.strip_suffix(Direction::Up.suffix()) {
-        (rest, Direction::Up)
-    } else {
-        (
-            stem.strip_suffix(Direction::Down.suffix())?,
-            Direction::Down,
-        )
-    };
+    let (stem, template) = [TemplateStyle::SqlJ2, TemplateStyle::J2Sql]
+        .into_iter()
+        .find_map(|style| Some((file_name.strip_suffix(style.extension())?, Some(style))))
+        .or_else(|| Some((file_name.strip_suffix(".sql")?, None)))?;
+    let (rest, direction) = [Direction::Up, Direction::Down]
+        .into_iter()
+        .find_map(|d| Some((stem.strip_suffix(&format!(".{}", d.as_str()))?, d)))?;
 
     let (version_part, name) = rest.split_once('_')?;
     let version: i64 = version_part.parse().ok()?;
@@ -78,12 +101,12 @@ fn parse(file_name: &str) -> Option<Parsed> {
 
 /// Build a migration from a parsed filename and its contents.
 fn migration(parsed: &Parsed, file_name: &str, sql: String) -> Result<Migration> {
-    if parsed.template && !cfg!(feature = "template") {
+    if parsed.template.is_some() && !cfg!(feature = "template") {
         return Err(ChumError::TemplatingDisabled(file_name.to_owned()));
     }
     Ok(
         Migration::new(parsed.version, parsed.description(), parsed.direction, sql)
-            .with_template(parsed.template)
+            .with_template(parsed.template.is_some())
             .with_file_name(file_name.to_owned()),
     )
 }
@@ -231,19 +254,18 @@ pub struct MigrationFile {
     pub name: String,
     /// Which half of the pair this file is.
     pub direction: Direction,
-    /// Whether the file is a `.sql.j2` template.
-    pub template: bool,
+    /// The extension style of a template; `None` for a plain `.sql` file.
+    pub template: Option<TemplateStyle>,
     /// The file's path on disk.
     pub path: PathBuf,
 }
 
 impl MigrationFile {
-    /// The filename suffix after `<version>_<name>`: `.up.sql`,
-    /// `.down.sql.j2`, …
+    /// The filename suffix after `<version>_<name>`, spelled as on disk:
+    /// `.up.sql`, `.down.sql.j2`, `.up.j2.sql`, …
     #[must_use]
     pub fn suffix(&self) -> String {
-        let j2 = if self.template { TEMPLATE_SUFFIX } else { "" };
-        format!("{}{j2}", self.direction.suffix())
+        suffix(self.direction, self.template)
     }
 }
 
@@ -290,8 +312,8 @@ pub fn migration_files(dir: &Path) -> Result<Vec<MigrationFile>> {
     Ok(files)
 }
 
-/// Scaffold an empty `up`/`down` migration pair in `dir`, as `.sql.j2`
-/// templates when `template` is set.
+/// Scaffold an empty `up`/`down` migration pair in `dir`, as templates spelled
+/// in the given style when `template` is set.
 ///
 /// `version` is the numeric prefix — either a UTC timestamp such as
 /// `20260626111407` or a zero-padded sequential counter such as `0001`.
@@ -305,12 +327,12 @@ pub fn scaffold(
     dir: &Path,
     version: &str,
     name: &str,
-    template: bool,
+    template: Option<TemplateStyle>,
 ) -> Result<(PathBuf, PathBuf)> {
     std::fs::create_dir_all(dir)?;
-    let j2 = if template { TEMPLATE_SUFFIX } else { "" };
-    let up = dir.join(format!("{version}_{name}.up.sql{j2}"));
-    let down = dir.join(format!("{version}_{name}.down.sql{j2}"));
+    let file = |direction| format!("{version}_{name}{}", suffix(direction, template));
+    let up = dir.join(file(Direction::Up));
+    let down = dir.join(file(Direction::Down));
     for path in [&up, &down] {
         if path.exists() {
             return Err(ChumError::Source(format!(
@@ -321,8 +343,8 @@ pub fn scaffold(
     }
     // A `--` comment in a template is still rendered; `{# … #}` isn't.
     let comment = |direction: &str| {
-        if template {
-            format!("{{# {version}_{name} ({direction}) #}}\n")
+        if template.is_some() {
+            format!("{{#{version}_{name} ({direction}) #}}\n")
         } else {
             format!("-- {version}_{name} ({direction})\n")
         }
@@ -354,7 +376,7 @@ mod tests {
         assert_eq!(p.version, 20_260_626_111_407);
         assert_eq!(p.description(), "initial schema");
         assert_eq!(p.direction, Direction::Up);
-        assert!(!p.template);
+        assert_eq!(p.template, None);
 
         let p = parse("0001_foo.down.sql").unwrap();
         assert_eq!(p.direction, Direction::Down);
@@ -366,11 +388,36 @@ mod tests {
         assert_eq!(p.version, 20_261_106_120_000);
         assert_eq!(p.name, "events_hourly_mv");
         assert_eq!(p.direction, Direction::Up);
-        assert!(p.template);
+        assert_eq!(p.template, Some(TemplateStyle::SqlJ2));
 
         let p = parse("0001_foo.down.sql.j2").unwrap();
         assert_eq!(p.direction, Direction::Down);
-        assert!(p.template);
+        assert_eq!(p.template, Some(TemplateStyle::SqlJ2));
+    }
+
+    #[test]
+    fn parses_j2_sql_templates() {
+        let p = parse("0001_foo.up.j2.sql").unwrap();
+        assert_eq!(p.version, 1);
+        assert_eq!(p.name, "foo");
+        assert_eq!(p.direction, Direction::Up);
+        assert_eq!(p.template, Some(TemplateStyle::J2Sql));
+
+        let p = parse("0001_foo.down.j2.sql").unwrap();
+        assert_eq!(p.direction, Direction::Down);
+        assert_eq!(p.template, Some(TemplateStyle::J2Sql));
+    }
+
+    #[test]
+    fn suffix_round_trips_the_spelling() {
+        for name in [
+            "0001_foo.up.sql",
+            "0001_foo.down.sql.j2",
+            "0001_foo.up.j2.sql",
+        ] {
+            let p = parse(name).unwrap();
+            assert_eq!(format!("0001_foo{}", suffix(p.direction, p.template)), name);
+        }
     }
 
     #[test]
@@ -407,13 +454,26 @@ mod tests {
 
     #[cfg(feature = "template")]
     #[test]
+    fn both_template_spellings_for_one_direction_are_rejected() {
+        let dir = write_dir("dup-spelling", &["0001_x.up.sql.j2", "0001_x.up.j2.sql"]);
+        let err = from_path(&dir).unwrap_err();
+        assert!(
+            matches!(err, ChumError::Source(ref m) if m.contains("two up")),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "template")]
+    #[test]
     fn templates_load_with_the_feature() {
-        let dir = write_dir("tpl", &["0001_x.up.sql.j2", "0001_x.down.sql"]);
+        let dir = write_dir("tpl", &["0001_x.up.sql.j2", "0001_x.down.j2.sql"]);
         let migrations = from_path(&dir).unwrap();
         assert!(migrations[0].template);
         assert_eq!(migrations[0].file_name, "0001_x.up.sql.j2");
         assert_eq!(migrations[0].description, "x");
-        assert!(!migrations[1].template);
+        assert!(migrations[1].template);
+        assert_eq!(migrations[1].file_name, "0001_x.down.j2.sql");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

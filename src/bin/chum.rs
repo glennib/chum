@@ -389,7 +389,7 @@ struct Cli {
     bookkeeping_database: String,
 
     /// Directory containing `<version>_<name>.{up,down}.sql` migration files
-    /// (and `.sql.j2` templates).
+    /// (and `.sql.j2` / `.j2.sql` templates).
     #[arg(long, env = "CHUM_SOURCE", default_value = "migrations", global = true)]
     source: PathBuf,
 
@@ -430,7 +430,8 @@ struct Cli {
 /// others.
 #[derive(Debug, Default, clap::Args)]
 struct VarArgs {
-    /// Set a variable for templated (`.sql.j2`) migrations. Repeatable.
+    /// Set a variable for templated (`.sql.j2` / `.j2.sql`) migrations.
+    /// Repeatable.
     ///
     /// A plain key (`tier=prod`) sets `env.tier` for every migration; a
     /// version-prefixed key (`20261106120000_cutoff=…`) sets `this.cutoff`
@@ -654,7 +655,8 @@ async fn run(cli: Cli) -> miette::Result<()> {
     } = &cli.command
     {
         let version = next_version(&cli.source, *sequential)?;
-        let (up, down) = source::scaffold(&cli.source, &version, name, *template)?;
+        let style = template.then_some(source::TemplateStyle::SqlJ2);
+        let (up, down) = source::scaffold(&cli.source, &version, name, style)?;
         return render_add(&up, &down, fmt);
     }
     if let Command::Convert { to, dry_run } = &cli.command {
@@ -1745,7 +1747,7 @@ fn run_convert(dir: &Path, to: Scheme, dry_run: bool, fmt: Resolved) -> miette::
 fn remind_about_version_keys(files: &[source::MigrationFile], map: &HashMap<i64, String>) {
     let renumbered: BTreeMap<i64, &String> = files
         .iter()
-        .filter(|f| f.template)
+        .filter(|f| f.template.is_some())
         .map(|f| (f.version, &map[&f.version]))
         .filter(|(old, new)| new.parse::<i64>().ok() != Some(*old))
         .collect();
@@ -2048,6 +2050,8 @@ mod tests {
         for name in [
             "20260101000000_first.up.sql.j2",
             "20260101000000_first.down.sql",
+            "20260102000000_second.up.j2.sql",
+            "20260102000000_second.down.j2.sql",
         ] {
             fs::write(dir.join(name), "-- x\n").expect("write");
         }
@@ -2057,7 +2061,15 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         names.sort();
-        assert_eq!(names, ["0001_first.down.sql", "0001_first.up.sql.j2"]);
+        assert_eq!(
+            names,
+            [
+                "0001_first.down.sql",
+                "0001_first.up.sql.j2",
+                "0002_second.down.j2.sql",
+                "0002_second.up.j2.sql",
+            ]
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

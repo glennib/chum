@@ -7,7 +7,8 @@
 //! cannot be fully parsed into an AST, but statement boundaries can be found
 //! robustly — see [`split`]).
 //!
-//! With the `template` feature, a file ending in `.sql.j2` is a [minijinja]
+//! With the `template` feature, a file ending in `.sql.j2` or `.j2.sql` is a
+//! [minijinja]
 //! template, rendered before it runs with the variables given to
 //! [`Migrator::vars`]: `env.<name>` for values describing the target
 //! environment, and `this.<name>` for values meant for one version. The values

@@ -90,19 +90,22 @@ preview the renames first.
 bookkeeping table is keyed by the old versions, a database that already applied
 these migrations must afterward be reset (drop and recreate the database, then
 re-run `chum run`) or have each new version `chum force`d. Convert before a
-migration set is widely deployed. `convert` keeps the `.j2` suffix of
-[templated migrations](#templated-migrations), and reminds you to rename any
+migration set is widely deployed. `convert` keeps the extension of
+[templated migrations](#templated-migrations) as spelled, and reminds you to rename any
 version-prefixed `--var` / `CHUM_VAR_*` keys for the renumbered versions.
 
 ## Templated migrations
 
-A migration file ending in `.sql.j2` is a [minijinja](https://docs.rs/minijinja)
-(Jinja2) template, rendered before it runs. Use it for SQL that differs between
-environments (a `GRANT` only in production, a retention period) or that needs a
-value only known at apply time (a backfill cutoff). Plain `.sql` files behave
-exactly as before. `chum add --template <name>` scaffolds a `.sql.j2` pair, and
-a template up with a plain down (or the reverse) is fine; a plain and a
-template file for the same version and direction is an error.
+A migration file ending in `.sql.j2` or `.j2.sql` (`0001_x.up.sql.j2`,
+`0001_x.up.j2.sql`) is a [minijinja](https://docs.rs/minijinja) (Jinja2)
+template, rendered before it runs. The two spellings are equivalent; `.j2.sql`
+keeps the file recognisable as SQL to editors and linters. Use a template for
+SQL that differs between environments (a `GRANT` only in production, a
+retention period) or that needs a value only known at apply time (a backfill
+cutoff). Plain `.sql` files behave exactly as before. `chum add --template
+<name>` scaffolds a template pair, and a template up with a plain down (or the
+reverse) is fine; two files for the same version and direction (plain and
+template, or both template spellings) are an error.
 
 ```sql
 -- 20261106090000_events.up.sql.j2
@@ -470,8 +473,8 @@ migrator.run(&client, &bookkeeping, None).await?;
 Templated migrations need the `template` feature (enabled by `cli`), which
 adds the `minijinja` dependency. Pass variables with `Migrator::vars`, e.g.
 `Vars::new().with_env("tier", "prod")`, or build them from `--var`-style keys
-with `Vars::from_keys`. Without the feature, a source containing a `.sql.j2`
-file fails to load with `TemplatingDisabled`.
+with `Vars::from_keys`. Without the feature, a source containing a template
+fails to load with `TemplatingDisabled`.
 
 The migrator takes a [`Bookkeeping`] target (database + table). It runs
 `CREATE DATABASE IF NOT EXISTS` for the bookkeeping database and fully-qualifies

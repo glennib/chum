@@ -28,8 +28,8 @@ pub enum ChumError {
             code(chum::source),
             help(
                 "Check that the migration directory exists and that every file is named \
-                 `<version>_<name>.{{up,down}}.sql`, or `.sql.j2` for a template. A version \
-                 can't have both a plain and a template file for one direction."
+                 `<version>_<name>.{{up,down}}.sql`, or `.sql.j2` / `.j2.sql` for a template. \
+                 A version can't have two files for one direction."
             )
         )
     )]
@@ -293,14 +293,14 @@ pub enum ChumError {
         state: State,
     },
 
-    /// The source contains a `.sql.j2` template, but the library was built
+    /// The source contains a `.sql.j2` or `.j2.sql` template, but the library was built
     /// without the `template` feature.
     #[error("{0} is a template, but chum was built without the `template` feature")]
     #[cfg_attr(
         feature = "diagnostic",
         diagnostic(
             code(chum::templating_disabled),
-            help("Enable chum's `template` cargo feature to load `.sql.j2` migrations.")
+            help("Enable chum's `template` cargo feature to load template migrations.")
         )
     )]
     TemplatingDisabled(String),
