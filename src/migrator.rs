@@ -20,6 +20,8 @@ use crate::backend::Bookkeeping;
 use crate::error::ChumError;
 use crate::error::RenderFailure;
 use crate::error::Result;
+#[cfg(feature = "template")]
+use crate::error::TemplateLocation;
 use crate::migration::AppliedMigration;
 use crate::migration::Direction;
 use crate::migration::Migration;
@@ -1023,7 +1025,21 @@ fn render_template(
         used: r.used,
         missing: r.missing,
     })
-    .map_err(|f| RenderFailure::new(migration.version, migration.direction, f.message, f.missing))
+    .map_err(|f| failure(migration, f))
+}
+
+#[cfg(feature = "template")]
+fn failure(migration: &Migration, f: crate::template::Failure) -> RenderFailure {
+    let location = f.span.map(|span| {
+        TemplateLocation::new(
+            migration.file_name.to_string(),
+            migration.sql.to_string(),
+            span,
+        )
+    });
+    RenderFailure::new(migration.version, migration.direction, f.message, f.missing)
+        .with_kind(f.kind)
+        .with_location(location)
 }
 
 #[cfg(not(feature = "template"))]
@@ -1071,6 +1087,7 @@ fn template_vars(migration: &Migration) -> BTreeSet<String> {
 #[cfg(all(test, feature = "template"))]
 mod tests {
     use super::*;
+    use crate::error::RenderFailureKind;
 
     fn up(version: i64, sql: &'static str) -> Migration {
         Migration::new(version, "m", Direction::Up, sql).with_template(true)
@@ -1108,6 +1125,41 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("`this.b`"), "{message}");
+    }
+
+    #[test]
+    fn render_failures_say_whether_the_value_or_the_template_is_wrong() {
+        let migrator = Migrator::new(vec![
+            up(1, "SELECT {{ this.cutoff | sql_datetime }}"),
+            up(2, "SELECT {{ this.cutoff }}"),
+            up(3, "SELECT {{ this.cutoff | sql_datetime64(10) }}"),
+        ])
+        .vars(
+            Vars::from_keys(
+                [
+                    ("1_cutoff".to_owned(), "2026-11-10".to_owned()),
+                    ("3_cutoff".to_owned(), "2026-11-10T09:00:00Z".to_owned()),
+                ],
+                [],
+            )
+            .unwrap(),
+        );
+        let err = migrator.render_many(&[1, 2, 3], Direction::Up).unwrap_err();
+        let ChumError::Render(failures) = err else {
+            panic!("expected Render, got {err}");
+        };
+        let kinds: Vec<RenderFailureKind> = failures.iter().map(|f| f.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                RenderFailureKind::InvalidValue,
+                RenderFailureKind::MissingValue,
+                RenderFailureKind::Template,
+            ]
+        );
+        let location = failures[0].location.as_ref().unwrap();
+        assert_eq!(location.file_name, "1_m.up.sql.j2");
+        assert_eq!(&location.text[location.span.clone()], "sql_datetime");
     }
 
     #[test]

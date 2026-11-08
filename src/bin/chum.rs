@@ -644,9 +644,70 @@ async fn main() -> ExitCode {
         Err(report) => {
             // `Report`'s `Debug` impl renders through the handler installed
             // above: the error chain, the `chum::*` code, and the `help` line.
-            eprintln!("{report:?}");
+            eprintln!("{:?}", template_report(report));
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Re-report a render failure with each failing template as a
+/// related diagnostic, so the report shows the line and underlines the
+/// expression. Other errors are returned as they are.
+fn template_report(report: miette::Report) -> miette::Report {
+    let failures = match report.downcast_ref::<chum::ChumError>() {
+        Some(chum::ChumError::Render(f)) if f.iter().any(|f| f.location.is_some()) => f.clone(),
+        _ => return report,
+    };
+    let diagnostic: &dyn miette::Diagnostic = report.as_ref();
+    let headline = report.to_string();
+    let headline = headline
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(':')
+        .to_owned();
+    miette::Report::new(TemplateReport {
+        headline,
+        code: diagnostic.code().map(|c| c.to_string()),
+        help: diagnostic.help().map(|h| h.to_string()),
+        failures,
+    })
+}
+
+/// See [`template_report`].
+#[derive(Debug)]
+struct TemplateReport {
+    headline: String,
+    code: Option<String>,
+    help: Option<String>,
+    failures: Vec<chum::RenderFailure>,
+}
+
+impl std::fmt::Display for TemplateReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.headline)
+    }
+}
+
+impl std::error::Error for TemplateReport {}
+
+impl miette::Diagnostic for TemplateReport {
+    fn code<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        self.code
+            .as_ref()
+            .map(|c| Box::new(c) as Box<dyn std::fmt::Display>)
+    }
+
+    fn help<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        self.help
+            .as_ref()
+            .map(|h| Box::new(h) as Box<dyn std::fmt::Display>)
+    }
+
+    fn related<'a>(&'a self) -> Option<Box<dyn Iterator<Item = &'a dyn miette::Diagnostic> + 'a>> {
+        Some(Box::new(
+            self.failures.iter().map(|f| f as &dyn miette::Diagnostic),
+        ))
     }
 }
 
@@ -2184,6 +2245,33 @@ mod tests {
             Command::Render { ref versions, from: None, down: true, .. } if versions == &[1, 2]
         ));
         assert!(Cli::try_parse_from(["chum", "render", "1", "--from", "1"]).is_err());
+    }
+
+    #[test]
+    fn template_report_relates_each_located_failure() {
+        let text = "SELECT {{ x | nope }}".to_owned();
+        let failure = chum::RenderFailure::new(
+            1,
+            Direction::Up,
+            "unknown filter: nope (in t:1)".into(),
+            Vec::new(),
+        )
+        .with_location(Some(chum::TemplateLocation::new("t".into(), text, 14..18)));
+        let report = template_report(miette::Report::new(chum::ChumError::Render(vec![
+            failure.clone(),
+            failure,
+        ])));
+        let diagnostic: &dyn miette::Diagnostic = report.as_ref();
+        assert_eq!(report.to_string(), "failed to render 2 migrations");
+        assert_eq!(diagnostic.code().unwrap().to_string(), "chum::render");
+        assert!(diagnostic.help().is_some());
+        assert_eq!(diagnostic.related().unwrap().count(), 2);
+
+        // Without a location there is nothing to show, so the error is kept.
+        let report = template_report(miette::Report::new(chum::ChumError::Render(vec![
+            chum::RenderFailure::new(1, Direction::Up, "x".into(), vec!["env.a".into()]),
+        ])));
+        assert!(report.to_string().contains("\n  - 1 (up): x"));
     }
 
     #[test]

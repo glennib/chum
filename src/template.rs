@@ -41,6 +41,7 @@ use minijinja::value::Enumerator;
 use minijinja::value::Object;
 use minijinja::value::ObjectRepr;
 
+use crate::error::RenderFailureKind;
 use crate::vars::References;
 
 /// The output of a successful render.
@@ -58,11 +59,15 @@ pub(crate) struct Rendered {
 /// Why a render failed.
 #[derive(Debug)]
 pub(crate) struct Failure {
-    /// minijinja's message, naming the template and line.
+    /// The message, naming the template and line.
     pub message: String,
     /// The names looked up without a value that the failing line refers to,
     /// or every such name when the line refers to none of them by name.
     pub missing: Vec<String>,
+    /// Whether the values or the template are at fault.
+    pub kind: RenderFailureKind,
+    /// The byte range of the failing expression in the template.
+    pub span: Option<std::ops::Range<usize>>,
 }
 
 fn environment() -> Environment<'static> {
@@ -110,10 +115,25 @@ pub(crate) fn render(
             used: log.used,
             missing: log.missing,
         }),
-        Err(err) => Err(Failure {
-            missing: missing_on_line(&err, source, &log.missing),
-            message: err.to_string(),
-        }),
+        Err(err) => {
+            let missing = missing_on_line(&err, source, &log.missing);
+            let kind = if !missing.is_empty() {
+                RenderFailureKind::MissingValue
+            } else if std::error::Error::source(&err)
+                .and_then(|s| s.downcast_ref::<InvalidValue>())
+                .is_some()
+            {
+                RenderFailureKind::InvalidValue
+            } else {
+                RenderFailureKind::Template
+            };
+            Err(Failure {
+                message: err.to_string(),
+                missing,
+                kind,
+                span: err.range(),
+            })
+        }
     }
 }
 
@@ -286,9 +306,12 @@ fn sql_datetime(value: String) -> Result<String, Error> {
 )]
 fn sql_datetime64(value: String, precision: u32) -> Result<String, Error> {
     if precision > 9 {
-        return Err(invalid(format!(
-            "DateTime64 precision must be 0 to 9, not {precision}"
-        )));
+        // The precision is written in the template, so this isn't an
+        // `invalid` value.
+        return Err(Error::new(
+            ErrorKind::InvalidOperation,
+            format!("DateTime64 precision must be 0 to 9, not {precision}"),
+        ));
     }
     let time = parse_rfc3339(&value)?;
     let unit = 10_u32.pow(9 - precision);
@@ -345,8 +368,21 @@ fn parse_rfc3339(value: &str) -> Result<DateTime<Utc>, Error> {
 }
 
 fn invalid(message: String) -> Error {
-    Error::new(ErrorKind::InvalidOperation, message)
+    Error::new(ErrorKind::InvalidOperation, message).with_source(InvalidValue)
 }
+
+/// Marks a filter's error as a rejected value, as opposed to a mistake in the
+/// template, so the failure's help points at the value.
+#[derive(Debug)]
+struct InvalidValue;
+
+impl std::fmt::Display for InvalidValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid value")
+    }
+}
+
+impl std::error::Error for InvalidValue {}
 
 #[derive(Debug, Default)]
 struct Log {

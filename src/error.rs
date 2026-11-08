@@ -227,18 +227,10 @@ pub enum ChumError {
 
     /// One or more templated migrations failed to render. Nothing was
     /// executed.
-    #[error("{}", render_message(.0))]
+    #[error("{}", failures_message(&render_headline(.0), .0))]
     #[cfg_attr(
         feature = "diagnostic",
-        diagnostic(
-            code(chum::render),
-            help(
-                "Supply each missing or invalid value with `--var <key>=<value>` or \
-                 `CHUM_VAR_<key>=<value>`: a plain key (`tier`) for `env.tier`, a version-prefixed \
-                 key (`<version>_cutoff`) for `this.cutoff`. `chum render` shows what a \
-                 migration renders to without connecting to ClickHouse."
-            )
-        )
+        diagnostic(code(chum::render), help("{}", render_help(.0)))
     )]
     Render(Vec<RenderFailure>),
 
@@ -307,6 +299,10 @@ pub enum ChumError {
 }
 
 /// Why one migration failed to render, as part of [`ChumError::Render`].
+///
+/// With the `diagnostic` feature it is a [`miette::Diagnostic`] whose source
+/// code is the template, labelled at [`RenderFailure::location`], so a
+/// reporter can show the failing line.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct RenderFailure {
@@ -319,18 +315,124 @@ pub struct RenderFailure {
     /// The namespaced names (`env.tier`) the failing line looked up that had
     /// no value.
     pub missing: Vec<String>,
+    /// Whether the values or the template are at fault.
+    pub kind: RenderFailureKind,
+    /// The template and the part of it that failed, when the engine reports
+    /// one.
+    pub location: Option<Box<TemplateLocation>>,
+}
+
+/// What a [`RenderFailure`] is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RenderFailureKind {
+    /// A variable the template needs has no value.
+    MissingValue,
+    /// A filter rejected a supplied value, e.g. `sql_datetime` given a time
+    /// without an offset.
+    InvalidValue,
+    /// The template itself is wrong, whatever the values: a syntax error, an
+    /// unknown filter or test, or a filter called with the wrong arguments.
+    Template,
+}
+
+/// A span of a template's text.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct TemplateLocation {
+    /// The template's file name.
+    pub file_name: String,
+    /// The whole template text.
+    pub text: String,
+    /// The byte range within [`TemplateLocation::text`].
+    pub span: std::ops::Range<usize>,
+}
+
+impl TemplateLocation {
+    /// Build a location.
+    #[must_use]
+    pub fn new(file_name: String, text: String, span: std::ops::Range<usize>) -> Self {
+        Self {
+            file_name,
+            text,
+            span,
+        }
+    }
 }
 
 impl RenderFailure {
-    /// Build a failure record.
+    /// Build a failure record: a [`RenderFailureKind::MissingValue`] when
+    /// `missing` names anything, else a [`RenderFailureKind::Template`], with
+    /// no location.
     #[must_use]
     pub fn new(version: i64, direction: Direction, message: String, missing: Vec<String>) -> Self {
+        let kind = if missing.is_empty() {
+            RenderFailureKind::Template
+        } else {
+            RenderFailureKind::MissingValue
+        };
         Self {
             version,
             direction,
             message,
             missing,
+            kind,
+            location: None,
         }
+    }
+
+    /// Set what the failure is about.
+    #[must_use]
+    pub fn with_kind(mut self, kind: RenderFailureKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Set where in the template it failed.
+    #[must_use]
+    pub fn with_location(mut self, location: Option<TemplateLocation>) -> Self {
+        self.location = location.map(Box::new);
+        self
+    }
+}
+
+impl std::error::Error for RenderFailure {}
+
+#[cfg(feature = "diagnostic")]
+impl miette::Diagnostic for RenderFailure {
+    fn source_code(&self) -> Option<&dyn miette::SourceCode> {
+        self.location
+            .as_deref()
+            .map(|l| l as &dyn miette::SourceCode)
+    }
+
+    fn labels(&self) -> Option<Box<dyn Iterator<Item = miette::LabeledSpan> + '_>> {
+        let location = self.location.as_ref()?;
+        Some(Box::new(std::iter::once(miette::LabeledSpan::underline(
+            location.span.clone(),
+        ))))
+    }
+}
+
+#[cfg(feature = "diagnostic")]
+impl miette::SourceCode for TemplateLocation {
+    fn read_span<'a>(
+        &'a self,
+        span: &miette::SourceSpan,
+        context_lines_before: usize,
+        context_lines_after: usize,
+    ) -> std::result::Result<Box<dyn miette::SpanContents<'a> + 'a>, miette::MietteError> {
+        let inner = self
+            .text
+            .read_span(span, context_lines_before, context_lines_after)?;
+        Ok(Box::new(miette::MietteSpanContents::new_named(
+            self.file_name.clone(),
+            inner.data(),
+            *inner.span(),
+            inner.line(),
+            inner.column(),
+            inner.line_count(),
+        )))
     }
 }
 
@@ -351,16 +453,56 @@ impl fmt::Display for RenderFailure {
     }
 }
 
-fn render_message(failures: &[RenderFailure]) -> String {
-    let mut out = match failures.len() {
-        1 => "failed to render 1 migration:".to_owned(),
-        n => format!("failed to render {n} migrations:"),
-    };
+fn plural(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
+}
+
+/// Rendering stops at a template's first error, so there is one failure per
+/// migration.
+fn render_headline(failures: &[RenderFailure]) -> String {
+    format!("failed to render {}", plural(failures.len(), "migration"))
+}
+
+fn failures_message(headline: &str, failures: &[RenderFailure]) -> String {
+    let mut out = format!("{headline}:");
     for failure in failures {
         out.push_str("\n  - ");
         out.push_str(&failure.to_string());
     }
     out
+}
+
+/// One sentence per kind of failure present, in a fixed order.
+#[cfg_attr(
+    not(feature = "diagnostic"),
+    expect(dead_code, reason = "only the diagnostic help uses it")
+)]
+fn render_help(failures: &[RenderFailure]) -> String {
+    let has = |kind| failures.iter().any(|f| f.kind == kind);
+    let mut sentences = Vec::new();
+    if has(RenderFailureKind::MissingValue) {
+        sentences.push(
+            "Supply each missing value with `--var <key>=<value>` or `CHUM_VAR_<key>=<value>`: a \
+             plain key (`tier`) for `env.tier`, a version-prefixed key (`<version>_cutoff`) for \
+             `this.cutoff`.",
+        );
+    }
+    if has(RenderFailureKind::InvalidValue) {
+        sentences.push(
+            "Correct each value a filter rejected, where it was supplied (`--var` or \
+             `CHUM_VAR_*`).",
+        );
+    }
+    if has(RenderFailureKind::Template) {
+        sentences.push("Fix the template file: the mistake doesn't depend on the supplied values.");
+    }
+    sentences
+        .push("`chum render` shows what a migration renders to without connecting to ClickHouse.");
+    sentences.join(" ")
 }
 
 /// The first line of `statement` that isn't blank or a `--` comment, cut to a
@@ -410,6 +552,23 @@ pub type Result<T> = std::result::Result<T, ChumError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "diagnostic")]
+    #[test]
+    fn render_help_covers_only_the_kinds_present() {
+        let failure =
+            |kind| RenderFailure::new(1, Direction::Up, String::new(), Vec::new()).with_kind(kind);
+        let invalid = render_help(&[failure(RenderFailureKind::InvalidValue)]);
+        assert!(invalid.starts_with("Correct each value a filter rejected"));
+        assert!(!invalid.contains("missing") && !invalid.contains("template file"));
+
+        let both = render_help(&[
+            failure(RenderFailureKind::Template),
+            failure(RenderFailureKind::MissingValue),
+        ]);
+        assert!(both.starts_with("Supply each missing value"));
+        assert!(both.contains("Fix the template file"));
+    }
 
     #[test]
     fn excerpt_skips_comments_and_truncates_long_lines() {

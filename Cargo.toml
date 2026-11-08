@@ -50,10 +50,10 @@ thiserror = "2"
 miette = { version = "7", default-features = false, features = ["derive"], optional = true }
 
 # Templating: optional in the library (`template` feature), always on for the
-# CLI. Only the `builtins` and `macros` engine features: without
-# `multi_template` there is no `include`/`import`/`extends`, and these pull in
-# no transitive dependencies.
-minijinja = { version = "3.0.5", default-features = false, features = ["builtins", "macros"], optional = true }
+# CLI. Without `multi_template` there is no `include`/`import`/`extends`, and
+# none of these engine features pull in transitive dependencies. `debug` gives
+# render errors a source span.
+minijinja = { version = "3.0.5", default-features = false, features = ["builtins", "macros", "debug"], optional = true }
 
 # CLI-only dependencies (gated behind the `cli` feature).
 clap = { version = "4.5", features = ["derive", "env"], optional = true }
