@@ -334,6 +334,63 @@ fn confirm(prompt: &str, assume_yes: bool, fmt: Resolved) -> miette::Result<bool
 #[derive(Debug, Parser)]
 #[command(name = "chum", version, about, styles = theme::CLAP_STYLES)]
 struct Cli {
+    #[command(flatten)]
+    output: OutputArgs,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+/// How output is presented. Every subcommand prints, so these are global: they
+/// are accepted before and after the subcommand.
+#[derive(Debug, clap::Args)]
+#[command(next_help_heading = "Output")]
+struct OutputArgs {
+    /// Output format. `auto` is a table on a terminal and TSV when redirected.
+    #[arg(long, value_enum, default_value = "auto", global = true)]
+    format: Format,
+
+    /// Shorthand for `--format json`. Wins over `--format` if both are given.
+    #[arg(long, global = true)]
+    json: bool,
+
+    /// When to colorize output.
+    #[arg(long, value_enum, default_value = "auto", global = true)]
+    color: ColorChoice,
+}
+
+/// `--source`, for the subcommands that read migration files.
+#[derive(Debug, clap::Args)]
+struct SourceArgs {
+    /// Directory containing `<version>_<name>.{up,down}.sql` migration files
+    /// (and `.sql.j2` / `.j2.sql` templates).
+    #[arg(
+        long = "source",
+        value_name = "DIR",
+        env = "CHUM_SOURCE",
+        default_value = "migrations"
+    )]
+    dir: PathBuf,
+}
+
+impl SourceArgs {
+    fn migrator(&self) -> miette::Result<Migrator> {
+        let Self { dir } = self;
+        Ok(Migrator::new(source::from_path(dir)?))
+    }
+
+    /// A migrator whose templates render with `--var` and `CHUM_VAR_*`.
+    fn migrator_with(&self, var: &VarArgs) -> miette::Result<Migrator> {
+        let VarArgs { vars } = var;
+        let vars = Vars::from_keys(vars.iter().cloned(), env_vars(std::env::vars_os())?)?;
+        Ok(self.migrator()?.vars(vars))
+    }
+}
+
+/// How to reach ClickHouse, for the subcommands that connect.
+#[derive(Debug, clap::Args)]
+#[command(next_help_heading = "Connection")]
+struct ConnectionArgs {
     /// ClickHouse connection URL. Either a bare HTTP endpoint
     /// (`http://host:8123`) or a full DSN
     /// (`clickhouse+https://user:pass@host:8123/database?secure=true`).
@@ -390,6 +447,21 @@ struct Cli {
     #[arg(long)]
     password: Option<String>,
 
+    /// Apply the cross-replica consistency bundle of session settings.
+    ///
+    /// Off by default: the `insert_quorum` settings it enables were found to
+    /// hang every bookkeeping `INSERT` against the managed Aiven cluster (the
+    /// `INSERT` blocks until `insert_quorum_timeout`), so the default keeps
+    /// chum's writes best-effort and unblocked. Enable only on a cluster where
+    /// the bundle is known to work and the linearizability guarantee is needed.
+    #[arg(long, env = "CHUM_STRICT_CONSISTENCY")]
+    strict_consistency: bool,
+}
+
+/// Where chum records applied migrations, for the subcommands that connect.
+#[derive(Debug, clap::Args)]
+#[command(next_help_heading = "Bookkeeping")]
+struct BookkeepingArgs {
     /// Name of the bookkeeping table recording applied migrations.
     #[arg(long, env = "CHUM_TABLE", default_value = chum::DEFAULT_TABLE)]
     table: String,
@@ -407,48 +479,23 @@ struct Cli {
         default_value = chum::DEFAULT_BOOKKEEPING_DATABASE
     )]
     bookkeeping_database: String,
-
-    /// Directory containing `<version>_<name>.{up,down}.sql` migration files
-    /// (and `.sql.j2` / `.j2.sql` templates).
-    #[arg(long, env = "CHUM_SOURCE", default_value = "migrations", global = true)]
-    source: PathBuf,
-
-    /// Output format. `auto` is a table on a terminal and TSV when redirected.
-    #[arg(long, value_enum, default_value = "auto", global = true)]
-    format: Format,
-
-    /// Shorthand for `--format json`. Wins over `--format` if both are given.
-    #[arg(long, global = true)]
-    json: bool,
-
-    /// When to colorize output.
-    #[arg(long, value_enum, default_value = "auto", global = true)]
-    color: ColorChoice,
-
-    /// Apply the cross-replica consistency bundle (see `build_client`).
-    ///
-    /// Off by default: the `insert_quorum` settings it enables were found to
-    /// hang every bookkeeping `INSERT` against the managed Aiven cluster (the
-    /// `INSERT` blocks until `insert_quorum_timeout`), so the default keeps
-    /// chum's writes best-effort and unblocked. Enable only on a cluster where
-    /// the bundle is known to work and the linearizability guarantee is needed.
-    #[arg(long, env = "CHUM_STRICT_CONSISTENCY", global = true)]
-    strict_consistency: bool,
-
-    #[command(flatten)]
-    var: VarArgs,
-
-    #[command(subcommand)]
-    command: Command,
 }
 
-/// `--var`, accepted both before the subcommand and after the subcommands that
-/// render templates.
-///
-/// Not a clap `global` arg: clap keeps only the occurrences after the
-/// subcommand when a global is given on both sides, silently dropping the
-/// others.
-#[derive(Debug, Default, clap::Args)]
+impl BookkeepingArgs {
+    fn bookkeeping(&self) -> miette::Result<chum::Bookkeeping> {
+        let Self {
+            table,
+            bookkeeping_database,
+        } = self;
+        Ok(chum::Bookkeeping::new(
+            bookkeeping_database.clone(),
+            table.clone(),
+        )?)
+    }
+}
+
+/// `--var`, for the subcommands that render templates.
+#[derive(Debug, clap::Args)]
 struct VarArgs {
     /// Set a variable for templated (`.sql.j2` / `.j2.sql`) migrations.
     /// Repeatable.
@@ -459,6 +506,14 @@ struct VarArgs {
     /// variables; `--var` wins for the same key.
     #[arg(long = "var", value_name = "KEY=VALUE", value_parser = parse_var)]
     vars: Vec<(String, String)>,
+}
+
+/// `--yes`, for the subcommands that ask before changing bookkeeping.
+#[derive(Debug, clap::Args)]
+struct YesArgs {
+    /// Skip the confirmation prompt. Required when not run interactively.
+    #[arg(long, short = 'y')]
+    yes: bool,
 }
 
 /// Parse a `--var` argument into its key and value, splitting at the first
@@ -502,7 +557,13 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
         #[command(flatten)]
+        src: SourceArgs,
+        #[command(flatten)]
         var: VarArgs,
+        #[command(flatten)]
+        connection: ConnectionArgs,
+        #[command(flatten)]
+        bookkeeping: BookkeepingArgs,
     },
     /// Revert applied migrations. With no flag, reverts the most recently
     /// applied migration.
@@ -517,14 +578,26 @@ enum Command {
         /// Show the migrations that would be reverted, without reverting them.
         #[arg(long)]
         dry_run: bool,
-        /// Skip the confirmation prompt. Required to revert non-interactively.
-        #[arg(long, short = 'y')]
-        yes: bool,
+        #[command(flatten)]
+        yes: YesArgs,
+        #[command(flatten)]
+        src: SourceArgs,
         #[command(flatten)]
         var: VarArgs,
+        #[command(flatten)]
+        connection: ConnectionArgs,
+        #[command(flatten)]
+        bookkeeping: BookkeepingArgs,
     },
     /// Show the state of every migration.
-    Info,
+    Info {
+        #[command(flatten)]
+        src: SourceArgs,
+        #[command(flatten)]
+        connection: ConnectionArgs,
+        #[command(flatten)]
+        bookkeeping: BookkeepingArgs,
+    },
     /// Print the SQL migrations render to, without connecting to ClickHouse.
     ///
     /// Each migration is preceded by a comment naming its file, and the output
@@ -545,6 +618,8 @@ enum Command {
         #[arg(long)]
         down: bool,
         #[command(flatten)]
+        src: SourceArgs,
+        #[command(flatten)]
         var: VarArgs,
     },
     /// Check every template for mistakes, without values or a connection.
@@ -559,6 +634,8 @@ enum Command {
         /// ones that can no longer change.
         #[arg(long)]
         from: Option<i64>,
+        #[command(flatten)]
+        src: SourceArgs,
     },
     /// Scaffold a new `up`/`down` migration pair in the source directory.
     Add {
@@ -580,6 +657,8 @@ enum Command {
         /// existing templates use. Implies `--template`.
         #[arg(long, value_enum, value_name = "EXT")]
         template_ext: Option<TemplateExt>,
+        #[command(flatten)]
+        src: SourceArgs,
     },
     /// Renumber every migration in the source directory to a numbering scheme.
     ///
@@ -594,6 +673,8 @@ enum Command {
         /// Show the renames without performing them.
         #[arg(long)]
         dry_run: bool,
+        #[command(flatten)]
+        src: SourceArgs,
     },
     /// Mark a version as applied without running it (clears a dirty state).
     ///
@@ -603,7 +684,13 @@ enum Command {
         /// The version to force.
         version: i64,
         #[command(flatten)]
+        src: SourceArgs,
+        #[command(flatten)]
         var: VarArgs,
+        #[command(flatten)]
+        connection: ConnectionArgs,
+        #[command(flatten)]
+        bookkeeping: BookkeepingArgs,
     },
     /// Make a dirty version pending again by deleting its bookkeeping rows.
     ///
@@ -614,34 +701,27 @@ enum Command {
     Reset {
         /// The dirty version to reset.
         version: i64,
-        /// Skip the confirmation prompt. Required to reset non-interactively.
-        #[arg(long, short = 'y')]
-        yes: bool,
+        #[command(flatten)]
+        yes: YesArgs,
+        #[command(flatten)]
+        connection: ConnectionArgs,
+        #[command(flatten)]
+        bookkeeping: BookkeepingArgs,
     },
-}
-
-impl Command {
-    /// The `--var` arguments given after the subcommand.
-    fn vars(&self) -> &[(String, String)] {
-        match self {
-            Command::Run { var, .. }
-            | Command::Revert { var, .. }
-            | Command::Render { var, .. }
-            | Command::Force { var, .. } => &var.vars,
-            Command::Info
-            | Command::Check { .. }
-            | Command::Add { .. }
-            | Command::Convert { .. }
-            | Command::Reset { .. } => &[],
-        }
-    }
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
-    cli.color.apply();
-    install_error_renderer(cli.color);
+    let Cli {
+        output: OutputArgs {
+            format,
+            json,
+            color,
+        },
+        command,
+    } = Cli::parse();
+    color.apply();
+    install_error_renderer(color);
 
     // Logs go to stderr so they never mix with JSON/TSV output on stdout, and
     // follow `--color` like everything else written there.
@@ -653,7 +733,7 @@ async fn main() -> ExitCode {
         .with_ansi(console::colors_enabled_stderr())
         .init();
 
-    match run(cli).await {
+    match run(command, format.resolve(json)).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(report) => {
             // `Report`'s `Debug` impl renders through the handler installed
@@ -749,58 +829,48 @@ fn install_error_renderer(color: ColorChoice) {
     }));
 }
 
-async fn run(cli: Cli) -> miette::Result<()> {
-    let fmt = cli.format.resolve(cli.json);
-
-    // `add` and `convert` are purely local and need no database connection.
-    if let Command::Add {
-        name,
-        sequential,
-        template,
-        template_ext,
-    } = &cli.command
-    {
-        let version = next_version(&cli.source, *sequential)?;
-        let style = match (template_ext, template) {
-            (Some(ext), _) => Some((*ext).into()),
-            (None, true) => Some(source::newest_template_style(&cli.source)?.unwrap_or_default()),
-            (None, false) => None,
-        };
-        let (up, down) = source::scaffold(&cli.source, &version, name, style)?;
-        return render_add(&up, &down, fmt);
-    }
-    if let Command::Convert { to, dry_run } = &cli.command {
-        return run_convert(&cli.source, *to, *dry_run, fmt);
-    }
-    // `check` needs neither variables nor a connection.
-    if let Command::Check { from } = &cli.command {
-        let migrator = Migrator::new(source::from_path(&cli.source)?);
-        return run_check(&migrator, *from, fmt);
-    }
-
-    let flags = cli.var.vars.iter().chain(cli.command.vars()).cloned();
-    let vars = Vars::from_keys(flags, env_vars(std::env::vars_os())?)?;
-    let migrator = Migrator::new(source::from_path(&cli.source)?).vars(vars);
-
-    // `render` is offline: it needs the source and variables, never a client.
-    if let Command::Render {
-        versions,
-        from,
-        down,
-        ..
-    } = &cli.command
-    {
-        return run_render(&migrator, versions, *from, *down, fmt);
-    }
-
-    let client = build_client(&cli)?;
-    let bookkeeping = chum::Bookkeeping::new(cli.bookkeeping_database.clone(), cli.table.clone())?;
-    let bookkeeping = &bookkeeping;
-
-    match cli.command {
-        Command::Run {
-            target, dry_run, ..
+async fn run(command: Command, fmt: Resolved) -> miette::Result<()> {
+    match command {
+        Command::Add {
+            name,
+            sequential,
+            template,
+            template_ext,
+            src: SourceArgs { dir },
         } => {
+            let version = next_version(&dir, sequential)?;
+            let style = match (template_ext, template) {
+                (Some(ext), _) => Some(ext.into()),
+                (None, true) => Some(source::newest_template_style(&dir)?.unwrap_or_default()),
+                (None, false) => None,
+            };
+            let (up, down) = source::scaffold(&dir, &version, &name, style)?;
+            render_add(&up, &down, fmt)?;
+        }
+        Command::Convert {
+            to,
+            dry_run,
+            src: SourceArgs { dir },
+        } => run_convert(&dir, to, dry_run, fmt)?,
+        Command::Check { from, src } => run_check(&src.migrator()?, from, fmt)?,
+        Command::Render {
+            versions,
+            from,
+            down,
+            src,
+            var,
+        } => run_render(&src.migrator_with(&var)?, &versions, from, down, fmt)?,
+        Command::Run {
+            target,
+            dry_run,
+            src,
+            var,
+            connection,
+            bookkeeping,
+        } => {
+            let migrator = src.migrator_with(&var)?;
+            let client = build_client(&connection)?;
+            let bookkeeping = &bookkeeping.bookkeeping()?;
             if dry_run {
                 let planned = migrator.plan(&client, bookkeeping, target).await?;
                 warn_vars(&migrator);
@@ -828,9 +898,15 @@ async fn run(cli: Cli) -> miette::Result<()> {
             target,
             steps,
             dry_run,
-            yes,
-            ..
+            yes: YesArgs { yes },
+            src,
+            var,
+            connection,
+            bookkeeping,
         } => {
+            let migrator = src.migrator_with(&var)?;
+            let client = build_client(&connection)?;
+            let bookkeeping = &bookkeeping.bookkeeping()?;
             let target =
                 resolve_revert_target(&migrator, &client, bookkeeping, target, steps).await?;
             let versions = migrator.revert_plan(&client, bookkeeping, target).await?;
@@ -865,13 +941,29 @@ async fn run(cli: Cli) -> miette::Result<()> {
                 }
             }
         }
-        Command::Info => {
+        Command::Info {
+            src,
+            connection,
+            bookkeeping,
+        } => {
+            let migrator = src.migrator()?;
+            let client = build_client(&connection)?;
+            let bookkeeping = &bookkeeping.bookkeeping()?;
             let pb = spinner("Reading migration state…");
             let statuses = migrator.info(&client, bookkeeping).await?;
             pb.finish_and_clear();
             render_info(&statuses, fmt)?;
         }
-        Command::Force { version, .. } => {
+        Command::Force {
+            version,
+            src,
+            var,
+            connection,
+            bookkeeping,
+        } => {
+            let migrator = src.migrator_with(&var)?;
+            let client = build_client(&connection)?;
+            let bookkeeping = &bookkeeping.bookkeeping()?;
             upgrade_bookkeeping(&client, bookkeeping).await?;
             let pb = spinner(&format!("Forcing {version} as applied…"));
             migrator.force(&client, bookkeeping, version).await?;
@@ -879,7 +971,14 @@ async fn run(cli: Cli) -> miette::Result<()> {
             warn_vars(&migrator);
             render_force(version, fmt)?;
         }
-        Command::Reset { version, yes } => {
+        Command::Reset {
+            version,
+            yes: YesArgs { yes },
+            connection,
+            bookkeeping,
+        } => {
+            let client = build_client(&connection)?;
+            let bookkeeping = &bookkeeping.bookkeeping()?;
             chum::backend::ensure_database(&client, bookkeeping).await?;
             chum::backend::ensure_table(&client, bookkeeping).await?;
             let dirty = chum::backend::list_applied(&client, bookkeeping)
@@ -897,15 +996,12 @@ async fn run(cli: Cli) -> miette::Result<()> {
                     println!("{}", theme::muted().apply_to("aborted"));
                 }
             } else {
-                migrator.reset(&client, bookkeeping, version).await?;
+                // Resetting reads only bookkeeping, so it takes no `--source`.
+                Migrator::new(Vec::new())
+                    .reset(&client, bookkeeping, version)
+                    .await?;
                 render_reset(version, fmt)?;
             }
-        }
-        Command::Add { .. }
-        | Command::Convert { .. }
-        | Command::Check { .. }
-        | Command::Render { .. } => {
-            unreachable!("handled above")
         }
     }
     Ok(())
@@ -1632,14 +1728,21 @@ fn sql_listing(migrations: &[&chum::Migration], rendered: &[Vec<String>]) -> Str
 /// `--url` prevents that. Only `CHUM_TABLE` / `CHUM_BOOKKEEPING_DATABASE`
 /// remain env-readable — they are `CHUM_*` tool config, not a connection
 /// target.
-fn build_client(cli: &Cli) -> miette::Result<clickhouse::Client> {
-    let parsed = Url::parse(&cli.url)
+fn build_client(connection: &ConnectionArgs) -> miette::Result<clickhouse::Client> {
+    let ConnectionArgs {
+        url,
+        database,
+        user,
+        password,
+        strict_consistency,
+    } = connection;
+    let parsed = Url::parse(url)
         .into_diagnostic()
-        .with_context(|| format!("invalid --url {:?}", cli.url))?;
+        .with_context(|| format!("invalid --url {url:?}"))?;
 
     let host = parsed
         .host_str()
-        .ok_or_else(|| miette!("connection URL {:?} has no host", cli.url))?;
+        .ok_or_else(|| miette!("connection URL {url:?} has no host"))?;
 
     let mut secure = parsed.scheme().to_ascii_lowercase().contains("https");
     let mut user_q = None;
@@ -1665,9 +1768,9 @@ fn build_client(cli: &Cli) -> miette::Result<clickhouse::Client> {
         (!trimmed.is_empty()).then(|| trimmed.to_owned())
     };
 
-    let user = cli.user.clone().or(userinfo_user).or(user_q);
-    let password = cli.password.clone().or(userinfo_password).or(password_q);
-    let database = cli.database.clone().or(path_database).or(database_q);
+    let user = user.clone().or(userinfo_user).or(user_q);
+    let password = password.clone().or(userinfo_password).or(password_q);
+    let database = database.clone().or(path_database).or(database_q);
 
     let scheme = if secure { "https" } else { "http" };
     let endpoint = match parsed.port() {
@@ -1709,7 +1812,7 @@ fn build_client(cli: &Cli) -> miette::Result<clickhouse::Client> {
     // C — defensive pins: never buffer the bookkeeping insert, and don't return
     // the HTTP response until the insert is fully committed.
     let mut client = clickhouse::Client::default().with_url(endpoint);
-    if cli.strict_consistency {
+    if *strict_consistency {
         client = client
             .with_setting("insert_quorum", "auto")
             .with_setting("insert_quorum_parallel", "0")
@@ -2007,15 +2110,86 @@ mod tests {
             "chum", "--json", "--color", "never", "revert", "--steps", "2", "--yes",
         ])
         .expect("valid args parse");
-        assert!(cli.json);
-        assert_eq!(cli.color, ColorChoice::Never);
+        assert!(cli.output.json);
+        assert_eq!(cli.output.color, ColorChoice::Never);
         match cli.command {
-            Command::Revert { steps, yes, .. } => {
+            Command::Revert {
+                steps,
+                yes: YesArgs { yes },
+                ..
+            } => {
                 assert_eq!(steps, Some(2));
                 assert!(yes);
             }
             _ => panic!("expected revert"),
         }
+
+        let cli = Cli::try_parse_from(["chum", "revert", "--format", "tsv", "--color", "always"])
+            .expect("globals after the subcommand");
+        assert_eq!(cli.output.format, Format::Tsv);
+        assert_eq!(cli.output.color, ColorChoice::Always);
+    }
+
+    #[test]
+    fn subcommand_flags_go_after_their_subcommand() {
+        use clap::Parser as _;
+        assert!(Cli::try_parse_from(["chum", "info", "--url", "http://h:1"]).is_ok());
+        assert!(Cli::try_parse_from(["chum", "--url", "http://h:1", "info"]).is_err());
+        assert!(Cli::try_parse_from(["chum", "--source", "m", "check"]).is_err());
+        assert!(Cli::try_parse_from(["chum", "--var", "a=b", "run"]).is_err());
+    }
+
+    #[test]
+    fn each_subcommand_takes_only_its_flags() {
+        use clap::CommandFactory as _;
+        const SOURCE: &[&str] = &["source"];
+        const DB: &[&str] = &[
+            "url",
+            "database",
+            "user",
+            "password",
+            "strict-consistency",
+            "table",
+            "bookkeeping-database",
+        ];
+        let expected: &[(&str, &[&[&str]])] = &[
+            ("run", &[&["target", "dry-run", "var"], SOURCE, DB]),
+            (
+                "revert",
+                &[&["target", "steps", "dry-run", "yes", "var"], SOURCE, DB],
+            ),
+            ("info", &[SOURCE, DB]),
+            ("render", &[&["from", "down", "var"], SOURCE]),
+            ("check", &[&["from"], SOURCE]),
+            (
+                "add",
+                &[&["sequential", "template", "template-ext"], SOURCE],
+            ),
+            ("convert", &[&["dry-run"], SOURCE]),
+            ("force", &[&["var"], SOURCE, DB]),
+            ("reset", &[&["yes"], DB]),
+        ];
+        let cli = Cli::command();
+        assert_eq!(
+            cli.get_subcommands().count(),
+            expected.len(),
+            "every subcommand is listed"
+        );
+        for (name, groups) in expected {
+            let sub = cli.find_subcommand(name).expect(name);
+            let mut got: Vec<&str> = sub.get_arguments().filter_map(|a| a.get_long()).collect();
+            let mut want: Vec<&str> = groups.concat();
+            got.sort_unstable();
+            want.sort_unstable();
+            assert_eq!(got, want, "flags of `chum {name}`");
+        }
+        let mut globals: Vec<&str> = cli
+            .get_arguments()
+            .filter(|a| a.is_global_set())
+            .filter_map(|a| a.get_long())
+            .collect();
+        globals.sort_unstable();
+        assert_eq!(globals, ["color", "format", "json"]);
     }
 
     #[test]
@@ -2092,8 +2266,14 @@ mod tests {
         // The documented default: absent `--bookkeeping-database` resolves to
         // `_chum`, wired from the `DEFAULT_BOOKKEEPING_DATABASE` constant.
         let cli = Cli::try_parse_from(["chum", "info"]).expect("valid args parse");
-        assert_eq!(cli.bookkeeping_database, chum::DEFAULT_BOOKKEEPING_DATABASE);
-        assert_eq!(cli.bookkeeping_database, "_chum");
+        let Command::Info { bookkeeping, .. } = cli.command else {
+            panic!("expected info");
+        };
+        assert_eq!(
+            bookkeeping.bookkeeping_database,
+            chum::DEFAULT_BOOKKEEPING_DATABASE
+        );
+        assert_eq!(bookkeeping.bookkeeping_database, "_chum");
     }
 
     #[test]
@@ -2107,15 +2287,18 @@ mod tests {
         // individual flags stay None.
         let cli = Cli::try_parse_from([
             "chum",
+            "info",
             "--url",
             "clickhouse+https://dsn_user:dsn_pass@localhost:8123/dsn_db?secure=true",
-            "info",
         ])
         .expect("valid args parse");
-        assert_eq!(cli.user, None);
-        assert_eq!(cli.password, None);
-        assert_eq!(cli.database, None);
-        build_client(&cli).expect("build client from a full DSN");
+        let Command::Info { connection, .. } = cli.command else {
+            panic!("expected info");
+        };
+        assert_eq!(connection.user, None);
+        assert_eq!(connection.password, None);
+        assert_eq!(connection.database, None);
+        build_client(&connection).expect("build client from a full DSN");
     }
 
     #[test]
@@ -2237,28 +2420,24 @@ mod tests {
         use clap::Parser as _;
         let cli = Cli::try_parse_from([
             "chum",
+            "run",
             "--var",
             "tier=prod",
-            "run",
             "--var",
             "20261106120000_cutoff=a=b",
         ])
         .expect("valid args parse");
-        let vars: Vec<_> = cli
-            .var
-            .vars
-            .iter()
-            .chain(cli.command.vars())
-            .cloned()
-            .collect();
+        let Command::Run { var, .. } = cli.command else {
+            panic!("expected run");
+        };
         assert_eq!(
-            vars,
+            var.vars,
             [
                 ("tier".to_owned(), "prod".to_owned()),
                 ("20261106120000_cutoff".to_owned(), "a=b".to_owned())
             ]
         );
-        assert!(Cli::try_parse_from(["chum", "--var", "novalue", "run"]).is_err());
+        assert!(Cli::try_parse_from(["chum", "run", "--var", "novalue"]).is_err());
     }
 
     #[test]
@@ -2296,9 +2475,9 @@ mod tests {
     fn check_takes_an_optional_from() {
         use clap::Parser as _;
         let cli = Cli::try_parse_from(["chum", "check"]).expect("bare");
-        assert!(matches!(cli.command, Command::Check { from: None }));
+        assert!(matches!(cli.command, Command::Check { from: None, .. }));
         let cli = Cli::try_parse_from(["chum", "check", "--from", "5"]).expect("from");
-        assert!(matches!(cli.command, Command::Check { from: Some(5) }));
+        assert!(matches!(cli.command, Command::Check { from: Some(5), .. }));
     }
 
     #[test]

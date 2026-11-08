@@ -135,10 +135,10 @@ supply picks the namespace:
 | `<name>` | `--var tier=prod` | `env.tier` | Describes the target environment; available to every migration. |
 | `<version>_<name>` | `--var 20261106120000_cutoff=2026-11-07` | `this.cutoff` | For that one version only. |
 
-Each key can be given as `--var <key>=<value>` (repeatable, before or after the
-subcommand) or as a `CHUM_VAR_<key>=<value>` environment variable, which suits a
-container deploy where per-environment values come from a ConfigMap. `--var`
-wins over `CHUM_VAR_<key>`. The version in a key is compared numerically
+Each key can be given as `--var <key>=<value>` (repeatable) or as a
+`CHUM_VAR_<key>=<value>` environment variable, which suits a container deploy
+where per-environment values come from a ConfigMap. `--var` wins over
+`CHUM_VAR_<key>`. The version in a key is compared numerically
 (`0005_x` and `5_x` are the same key), names must match `[A-Za-z_][A-Za-z0-9_]*`,
 and giving the same key twice from one source is an error.
 
@@ -349,7 +349,7 @@ rebuilt database), the view covers everything from the start, there is nothing
 to backfill, and any cutoff or none is accepted.
 
 ```bash
-chum --url "$STAGING_URL" run --var 20261106120000_cutoff=2026-11-06T14:00:00Z
+chum run --url "$STAGING_URL" --var 20261106120000_cutoff=2026-11-06T14:00:00Z
 ```
 
 Where chum runs as a Kubernetes Job, the release that ships the migration adds
@@ -409,22 +409,27 @@ revert and asks for confirmation. Non-interactively (piped, or `--json` /
 prompt.
 
 Connection, source, and presentation are configured by flags or environment
-variables:
+variables. The presentation flags (`--format`, `--json`, `--color`) apply to
+every subcommand and go before or after it. Every other flag belongs to the
+subcommands that use it and goes after the subcommand's name, e.g. `chum run
+--url "$URL" --var tier=prod`. `chum <subcommand> --help` lists what each one
+accepts.
 
-| Flag | Env | Default | Notes |
-|------|-----|---------|-------|
-| `--url` | *(none)* | `http://localhost:8123` | Bare endpoint or full DSN (see below). Explicit flag only — **not** read from the environment. |
-| `--database` | *(none)* | — | Session default database for **unqualified** names in your migration SQL — *not* where bookkeeping lives (see below). Explicit flag or DSN only — **not** read from the environment. If set, it must already exist. |
-| `--user` | *(none)* | — | Overrides the user in the URL. Explicit flag or DSN only — **not** read from the environment. |
-| `--password` | *(none)* | — | Overrides the password in the URL. Explicit flag or DSN only — **not** read from the environment. |
-| `--table` | `CHUM_TABLE` | `_chum_migrations` | Bookkeeping table name |
-| `--bookkeeping-database` | `CHUM_BOOKKEEPING_DATABASE` | `_chum` | Dedicated database holding the bookkeeping table; chum creates it |
-| `--strict-consistency` | `CHUM_STRICT_CONSISTENCY` | off | Apply the [cross-replica consistency](#cross-replica-consistency) settings |
-| `--source` | `CHUM_SOURCE` | `migrations` | Migration directory |
-| `--format` | — | `auto` | `auto` \| `pretty` \| `json` \| `tsv` (`auto` = table on a tty, TSV when piped) |
-| `--json` | — | — | Shorthand for `--format json` |
-| `--color` | — | `auto` | `auto` \| `always` \| `never` (honors `NO_COLOR`) |
-| `--var <key>=<value>` | `CHUM_VAR_<key>` | — | A variable for [templated migrations](#templated-migrations). Repeatable. A plain key sets `env.<key>`; a version-prefixed key (`<version>_<name>`) sets `this.<name>` for that version only. `--var` wins over `CHUM_VAR_<key>`. Accepted by `run`, `revert`, `render` and `force`, before or after the subcommand. |
+| Flag | Env | Default | Accepted by | Notes |
+|------|-----|---------|-------------|-------|
+| `--url` | *(none)* | `http://localhost:8123` | `run`, `revert`, `info`, `force`, `reset` | Bare endpoint or full DSN (see below). Explicit flag only — **not** read from the environment. |
+| `--database` | *(none)* | — | `run`, `revert`, `info`, `force`, `reset` | Session default database for **unqualified** names in your migration SQL — *not* where bookkeeping lives (see below). Explicit flag or DSN only — **not** read from the environment. If set, it must already exist. |
+| `--user` | *(none)* | — | `run`, `revert`, `info`, `force`, `reset` | Overrides the user in the URL. Explicit flag or DSN only — **not** read from the environment. |
+| `--password` | *(none)* | — | `run`, `revert`, `info`, `force`, `reset` | Overrides the password in the URL. Explicit flag or DSN only — **not** read from the environment. |
+| `--table` | `CHUM_TABLE` | `_chum_migrations` | `run`, `revert`, `info`, `force`, `reset` | Bookkeeping table name |
+| `--bookkeeping-database` | `CHUM_BOOKKEEPING_DATABASE` | `_chum` | `run`, `revert`, `info`, `force`, `reset` | Dedicated database holding the bookkeeping table; chum creates it |
+| `--strict-consistency` | `CHUM_STRICT_CONSISTENCY` | off | `run`, `revert`, `info`, `force`, `reset` | Apply the [cross-replica consistency](#cross-replica-consistency) settings |
+| `--source` | `CHUM_SOURCE` | `migrations` | every subcommand but `reset` | Migration directory |
+| `--var <key>=<value>` | `CHUM_VAR_<key>` | — | `run`, `revert`, `render`, `force` | A variable for [templated migrations](#templated-migrations). Repeatable. A plain key sets `env.<key>`; a version-prefixed key (`<version>_<name>`) sets `this.<name>` for that version only. `--var` wins over `CHUM_VAR_<key>`. |
+| `--yes`, `-y` | — | — | `revert`, `reset` | Skip the confirmation prompt; required when not interactive |
+| `--format` | — | `auto` | every subcommand | `auto` \| `pretty` \| `json` \| `tsv` (`auto` = table on a tty, TSV when piped) |
+| `--json` | — | — | every subcommand | Shorthand for `--format json` |
+| `--color` | — | `auto` | every subcommand | `auto` \| `always` \| `never` (honors `NO_COLOR`) |
 
 `--url` accepts either a bare HTTP endpoint or a full DSN, e.g.
 `clickhouse+https://user:pass@host:8123/mydb?secure=true`. The CLI maps it to

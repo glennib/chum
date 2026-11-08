@@ -57,7 +57,15 @@ default_value = …)]` in `src/bin/chum.rs`. When adding, renaming, or changing 
 flag's default, update **both** touchpoints in the same change:
 
 1. the clap field (and its `env`/`default_value`), and
-2. `README.md` — the flag/env table (and any per-subcommand usage block).
+2. `README.md` — the flag/env table, including its "Accepted by" column (and
+   any per-subcommand usage block).
+
+A flag is offered only by the subcommands that use it, so each `--help` lists
+only what applies. A flag used by several subcommands lives in its own
+`#[derive(clap::Args)]` struct (`SourceArgs`, `ConnectionArgs`,
+`BookkeepingArgs`, `VarArgs`, `YesArgs`) flattened into each of them. Only
+flags every subcommand uses (`OutputArgs`) are `global = true`, so they go
+before or after the subcommand; all others go after it.
 
 There is no separate config file: clap is the single source of truth for
 defaults and env-var mapping.
