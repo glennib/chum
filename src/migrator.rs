@@ -1,10 +1,11 @@
 //! The migrator: validates the recorded state against the source set and
 //! applies, reverts, or reports migrations.
 //!
-//! Every command that executes migrations renders and splits all of them
-//! before running the first statement, so a missing variable, a template
-//! error or a split error anywhere aborts the command with nothing executed
-//! and no marker written.
+//! Every command that executes migrations checks, renders and splits all of
+//! them before running the first statement, so a template mistake, a missing
+//! variable or a split error anywhere aborts the command with nothing
+//! executed and no marker written. The check covers every branch of a
+//! template, including those the supplied values don't take.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -261,6 +262,34 @@ impl Migrator {
     #[must_use]
     pub fn migrations(&self) -> &[Migration] {
         &self.migrations
+    }
+
+    /// Check every template for mistakes that don't depend on the supplied
+    /// values, without rendering it: a syntax error, or, in every branch, an
+    /// unknown filter or test or one of chum's filters called with the wrong
+    /// number of arguments. Plain migrations always pass.
+    ///
+    /// Needs no variables and no client, so a test can call it on embedded
+    /// migrations to catch a mistake in a branch that only some environment
+    /// reaches.
+    ///
+    /// # Errors
+    ///
+    /// [`ChumError::Check`] listing every mistake, or
+    /// [`ChumError::TemplatingDisabled`] for a template when chum is built
+    /// without the `template` feature.
+    pub fn check(&self) -> Result<()> {
+        self.check_matching(|_| true)
+    }
+
+    /// Like [`Migrator::check`], for the migrations `keep` returns true for,
+    /// e.g. to skip templates that are already applied and can't be changed.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Migrator::check`].
+    pub fn check_matching(&self, keep: impl Fn(&Migration) -> bool) -> Result<()> {
+        check_all(self.migrations.iter().filter(|m| keep(m)))
     }
 
     /// Iterator over the up migrations, in ascending version order.
@@ -750,14 +779,17 @@ impl Migrator {
         Ok(applied.into_iter().map(|m| (m.version, m)).collect())
     }
 
-    /// Render and split every migration, each with the values recorded for
-    /// its version (if any). Rendering failures are collected across all of
-    /// them before returning; split errors are checked only once everything
-    /// rendered.
+    /// Check, render and split every migration, each with the values recorded
+    /// for its version (if any). Check failures across all of them are
+    /// reported first, then rendering failures; split errors are checked only
+    /// once everything rendered.
     fn prepare<'a, I>(&'a self, migrations: I) -> Result<Vec<Prepared<'a>>>
     where
         I: IntoIterator<Item = (&'a Migration, Option<&'a BTreeMap<String, String>>)>,
     {
+        let migrations: Vec<_> = migrations.into_iter().collect();
+        check_all(migrations.iter().map(|(m, _)| *m))?;
+
         let mut rendered = Vec::new();
         let mut failures = Vec::new();
         for (migration, recorded) in migrations {
@@ -1028,6 +1060,40 @@ fn render_template(
     .map_err(|f| failure(migration, f))
 }
 
+/// Statically check every template among `migrations`.
+fn check_all<'a>(migrations: impl IntoIterator<Item = &'a Migration>) -> Result<()> {
+    let mut failures = Vec::new();
+    for migration in migrations {
+        if !migration.template {
+            continue;
+        }
+        if !cfg!(feature = "template") {
+            return Err(ChumError::TemplatingDisabled(
+                migration.file_name.to_string(),
+            ));
+        }
+        failures.extend(check_template(migration));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(ChumError::Check(failures))
+    }
+}
+
+#[cfg(feature = "template")]
+fn check_template(migration: &Migration) -> Vec<RenderFailure> {
+    crate::template::check(&migration.file_name, &migration.sql)
+        .into_iter()
+        .map(|f| failure(migration, f))
+        .collect()
+}
+
+#[cfg(not(feature = "template"))]
+fn check_template(_migration: &Migration) -> Vec<RenderFailure> {
+    Vec::new()
+}
+
 #[cfg(feature = "template")]
 fn failure(migration: &Migration, f: crate::template::Failure) -> RenderFailure {
     let location = f.span.map(|span| {
@@ -1125,6 +1191,39 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("`this.b`"), "{message}");
+    }
+
+    #[test]
+    fn mistakes_in_untaken_branches_fail_before_rendering() {
+        let migrator = Migrator::new(vec![
+            up(
+                1,
+                "{% if this.cutoff is defined %}{{ this.cutoff | sql_datetime64 }}{% endif %}",
+            ),
+            up(2, "SELECT {{ env.missing }}"),
+            up(3, "{% if false %}{{ 1 | nope }}{{ 2 | nope }}{% endif %}"),
+        ]);
+        // Version 2's missing value isn't reported: the check runs first.
+        let err = migrator.render_many(&[1, 2, 3], Direction::Up).unwrap_err();
+        let ChumError::Check(failures) = err else {
+            panic!("expected Check, got {err}");
+        };
+        let versions: Vec<i64> = failures.iter().map(|f| f.version).collect();
+        assert_eq!(versions, [1, 3, 3]);
+        assert!(
+            failures
+                .iter()
+                .all(|f| f.kind == RenderFailureKind::Template && f.location.is_some())
+        );
+        let message = ChumError::Check(failures).to_string();
+        assert!(
+            message.starts_with("3 template mistakes in 2 migrations:"),
+            "{message}"
+        );
+        assert!(message.contains("filter sql_datetime64 takes one argument"));
+
+        assert!(matches!(migrator.check(), Err(ChumError::Check(_))));
+        migrator.check_matching(|m| m.version == 2).unwrap();
     }
 
     #[test]

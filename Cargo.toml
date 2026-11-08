@@ -52,8 +52,11 @@ miette = { version = "7", default-features = false, features = ["derive"], optio
 # Templating: optional in the library (`template` feature), always on for the
 # CLI. Without `multi_template` there is no `include`/`import`/`extends`, and
 # none of these engine features pull in transitive dependencies. `debug` gives
-# render errors a source span.
-minijinja = { version = "3.0.5", default-features = false, features = ["builtins", "macros", "debug"], optional = true }
+# render errors a source span; `unstable_machinery` exposes the compiled
+# instructions that `chum check` walks. That API has no semver guarantee, so
+# the requirement is held to one minor version: a bump is a deliberate change
+# that CI verifies.
+minijinja = { version = "~3.1.0", default-features = false, features = ["builtins", "macros", "debug", "unstable_machinery"], optional = true }
 
 # CLI-only dependencies (gated behind the `cli` feature).
 clap = { version = "4.5", features = ["derive", "env"], optional = true }

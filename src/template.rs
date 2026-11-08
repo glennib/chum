@@ -36,6 +36,8 @@ use minijinja::ErrorKind;
 use minijinja::State;
 use minijinja::UndefinedBehavior;
 use minijinja::Value;
+use minijinja::machinery;
+use minijinja::machinery::Instruction;
 use minijinja::syntax::SyntaxConfig;
 use minijinja::value::Enumerator;
 use minijinja::value::Object;
@@ -56,7 +58,7 @@ pub(crate) struct Rendered {
     pub missing: BTreeSet<String>,
 }
 
-/// Why a render failed.
+/// Why a render or check failed.
 #[derive(Debug)]
 pub(crate) struct Failure {
     /// The message, naming the template and line.
@@ -69,6 +71,25 @@ pub(crate) struct Failure {
     /// The byte range of the failing expression in the template.
     pub span: Option<std::ops::Range<usize>>,
 }
+
+/// chum's own filters: how many arguments each takes, counting the filtered
+/// value, and how to call it. `check` uses it to report a wrong call before
+/// any value is supplied.
+const FILTER_USAGE: [(&str, u16, &str); 5] = [
+    ("sql_string", 1, "takes no arguments: `value | sql_string`"),
+    ("sql_ident", 1, "takes no arguments: `value | sql_ident`"),
+    ("sql_date", 1, "takes no arguments: `value | sql_date`"),
+    (
+        "sql_datetime",
+        1,
+        "takes no arguments: `value | sql_datetime`",
+    ),
+    (
+        "sql_datetime64",
+        2,
+        "takes one argument, the precision: `value | sql_datetime64(3)`",
+    ),
+];
 
 fn environment() -> Environment<'static> {
     let mut env = Environment::new();
@@ -134,6 +155,81 @@ pub(crate) fn render(
                 span: err.range(),
             })
         }
+    }
+}
+
+/// Find the mistakes in the template `source` that don't depend on values: a
+/// syntax error, or, in every branch, an unknown filter or test or one of
+/// chum's filters called with the wrong number of arguments.
+///
+/// minijinja resolves filters and tests only when an expression runs, so
+/// rendering alone misses them in a branch the supplied values don't take.
+pub(crate) fn check(name: &str, source: &str) -> Vec<Failure> {
+    let environment = environment();
+    let template = match environment.template_from_named_str(name, source) {
+        Ok(template) => template,
+        Err(err) => {
+            return vec![Failure {
+                message: err.to_string(),
+                missing: Vec::new(),
+                kind: RenderFailureKind::Template,
+                span: err.range(),
+            }];
+        }
+    };
+    let compiled = machinery::get_compiled_template(&template);
+    let mut state = template.new_state();
+    let mut failures = Vec::new();
+    for instructions in std::iter::once(&compiled.instructions).chain(compiled.blocks.values()) {
+        for idx in 0.. {
+            let Some(instruction) = instructions.get(idx) else {
+                break;
+            };
+            let problem = match *instruction {
+                Instruction::ApplyFilter(filter, args, _) => check_filter(&mut state, filter, args),
+                Instruction::PerformTest(test, _, _) => check_test(&mut state, test),
+                _ => None,
+            };
+            if let Some(problem) = problem {
+                let line = instructions
+                    .get_line(idx)
+                    .map_or_else(String::new, |line| format!(":{line}"));
+                failures.push(Failure {
+                    message: format!("{problem} (in {name}{line})"),
+                    missing: Vec::new(),
+                    kind: RenderFailureKind::Template,
+                    span: instructions
+                        .get_span(idx)
+                        .map(|s| s.start_offset as usize..s.end_offset as usize),
+                });
+            }
+        }
+    }
+    failures
+}
+
+/// A wrong call of one of chum's filters, or an unknown filter. `args` counts
+/// the filtered value and is `None` for a call that splats its arguments.
+fn check_filter(state: &mut State, filter: &str, args: Option<u16>) -> Option<String> {
+    if let Some((_, arity, usage)) = FILTER_USAGE.iter().find(|(name, ..)| *name == filter) {
+        return args
+            .is_some_and(|args| args != *arity)
+            .then(|| format!("wrong arguments: filter {filter} {usage}"));
+    }
+    // Looking a filter up runs it; with no arguments a builtin returns an
+    // argument error, which is ignored here.
+    match state.apply_filter(filter, &[]) {
+        Err(err) if err.kind() == ErrorKind::UnknownFilter => {
+            Some(format!("unknown filter: {filter}"))
+        }
+        _ => None,
+    }
+}
+
+fn check_test(state: &mut State, test: &str) -> Option<String> {
+    match state.perform_test(test, &[]) {
+        Err(err) if err.kind() == ErrorKind::UnknownTest => Some(format!("unknown test: {test}")),
+        _ => None,
     }
 }
 
@@ -875,6 +971,94 @@ mod tests {
         }
         // The precision is required, as it is in the ClickHouse type.
         assert!(filtered("sql_datetime64", "2026-11-10T09:00:00Z").is_err());
+    }
+
+    /// Each mistake `check` finds in `source`, with the text its span covers.
+    fn checked(source: &str) -> Vec<(String, String)> {
+        check("t", source)
+            .into_iter()
+            .map(|f| {
+                assert_eq!(f.kind, RenderFailureKind::Template);
+                let covered = f.span.map(|s| source[s].to_owned()).unwrap_or_default();
+                (f.message, covered)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn check_finds_mistakes_in_every_branch() {
+        let found = checked(
+            "{% if false %}
+{{ x | sql_datetim }}
+{% else %}
+{{ x | sql_datetime64 }} {{ x | sql_string(1) }} {{ x is definedd }}
+{% endif %}",
+        );
+        let found: Vec<(&str, &str)> = found
+            .iter()
+            .map(|(m, s)| (m.as_str(), s.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("unknown filter: sql_datetim (in t:2)", "sql_datetim"),
+                (
+                    "wrong arguments: filter sql_datetime64 takes one argument, the precision: \
+                     `value | sql_datetime64(3)` (in t:4)",
+                    "sql_datetime64"
+                ),
+                (
+                    "wrong arguments: filter sql_string takes no arguments: `value | sql_string` \
+                     (in t:4)",
+                    "sql_string(1)"
+                ),
+                ("unknown test: definedd (in t:4)", "definedd"),
+            ]
+        );
+    }
+
+    #[test]
+    fn check_accepts_builtins_macros_and_correct_calls() {
+        let found = checked(
+            "{% macro quoted(v) %}{{ v | upper | sql_string }}{% endmacro %}
+{{ quoted(env.x) }} {{ this.c | default('a') | sql_datetime64(3) }}
+{% if env.t is defined and env.t is not none %}{% endif %}
+{% for i in range(3) %}{{ i | string | sql_ident }}{% endfor %}
+{{ this.d | sql_date }} {{ this.t | sql_datetime }}",
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn check_looks_inside_macros() {
+        let found = checked("{% macro m(v) %}{{ v | nope }}{% endmacro %}");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "unknown filter: nope (in t:1)");
+    }
+
+    #[test]
+    fn check_reports_a_syntax_error() {
+        let found = checked("SELECT 1;\n{{ x | }}");
+        assert_eq!(found.len(), 1);
+        assert!(found[0].0.starts_with("syntax error"), "{found:?}");
+        assert!(found[0].0.ends_with("(in t:2)"), "{found:?}");
+    }
+
+    #[test]
+    fn filter_usage_lists_registered_filters() {
+        let environment = environment();
+        let template = environment.template_from_str("").unwrap();
+        let mut state = template.new_state();
+        for (name, arity, _) in FILTER_USAGE {
+            let found = state.apply_filter(name, &[]);
+            assert!(
+                !matches!(found, Err(ref e) if e.kind() == ErrorKind::UnknownFilter),
+                "{name}"
+            );
+            let args = if arity == 2 { "(3)" } else { "" };
+            let source = format!("{{{{ x | {name}{args} }}}}");
+            assert!(checked(&source).is_empty(), "{source}");
+        }
     }
 
     #[test]

@@ -201,13 +201,16 @@ by the command used.
 | `run`, `run --dry-run` | every pending migration up to `--target` | `--var`, `CHUM_VAR_*` |
 | `revert`, `revert --dry-run` | the down of each version reverted | supplied and recorded |
 | `force <version>` | the up, without executing it | supplied and recorded |
+| `check` (offline) | nothing; checks every template | none |
 | `info`, `add`, `convert`, `reset` | nothing | none |
 
-`run` renders and splits every pending migration before the first one runs, and
-`revert` does the same with its downs, so a missing variable or template error
-anywhere aborts the command before any migration statement runs, listing every
-migration that failed. `run --dry-run` lists each value it would use and where
-it came from (`--var`, environment, recorded or default).
+`run` checks, renders and splits every pending migration before the first one
+runs, and `revert` does the same with its downs, so a template mistake, a
+missing variable or an invalid value anywhere aborts the command before any
+migration statement runs, listing every migration that failed. The check comes
+first and covers every branch of the template (see [`chum
+check`](#checking-chum-check)). `run --dry-run` lists each value it would use
+and where it came from (`--var`, environment, recorded or default).
 
 Each bookkeeping marker records the values the migration used, as namespaced
 keys (`env.tier`, `this.cutoff`): the values the up looked up while rendering,
@@ -254,6 +257,33 @@ downs instead, newest first. Plain migrations are printed as they are. Each
 migration is preceded by a `-- <file>` comment and the output is valid SQL.
 `render` can't see recorded values, so `render --down` matches what `revert`
 would run only when given the values the up used.
+
+### Checking: `chum check`
+
+Rendering resolves a filter or test only when the line runs, so a mistake in a
+branch the supplied values don't take goes unnoticed: `{{ this.cutoff |
+sql_datetim }}` inside `{% if this.cutoff is defined %}` renders fine on a
+laptop and in CI, and fails first where a cutoff is supplied. `chum check`
+finds these without values and without connecting to ClickHouse, in every
+branch of every template:
+
+- syntax errors;
+- unknown filters and tests;
+- chum's filters called with the wrong number of arguments, such as
+  `sql_datetime64` without its precision.
+
+```text
+chum check [--from VERSION]
+```
+
+`--from` checks only templates from that version on. Editing an applied
+template is drift, so a mistake in one that is already applied can't be fixed
+in place. `run`, `revert`, `force` and `render` run the same check on the
+migrations they are about to render, before rendering them. Errors show the
+template line with the failing expression underlined, and their help says
+whether the template, a missing value or an invalid value is at fault. Values
+themselves, and arguments such as the precision, are still checked when the
+template renders.
 
 ### Guards and `chum reset`
 
@@ -350,6 +380,8 @@ chum add --template backfill   # scaffold a template pair instead of plain .sql 
 chum add --template-ext j2.sql backfill  # scaffold a .j2.sql template pair, whatever the dir uses
 chum render --var tier=prod    # print the SQL every template renders to (offline)
 chum render --from 20260626 --down  # print the down SQL from a version on, newest first
+chum check                     # find template mistakes in every branch (offline)
+chum check --from 20260626     # only templates from a version on
 chum convert sequential        # renumber every migration to 0001, 0002, … (renames files)
 chum convert timestamp         # renumber every migration to UTC timestamps
 chum convert sequential --dry-run   # show the renames without performing them
@@ -502,6 +534,19 @@ adds the `minijinja` dependency. Pass variables with `Migrator::vars`, e.g.
 `Vars::new().with_env("tier", "prod")`, or build them from `--var`-style keys
 with `Vars::from_keys`. Without the feature, a source containing a template
 fails to load with `TemplatingDisabled`.
+
+`Migrator::check` runs the [`chum check`](#checking-chum-check) checks with no
+variables and no client, so a test can catch a template mistake at review time,
+whichever branches the deployed values take:
+
+```rust,ignore
+#[test]
+fn migrations_have_no_template_mistakes() {
+    Migrator::new(source::from_dir(&MIGRATIONS).unwrap()).check().unwrap();
+}
+```
+
+`Migrator::check_matching` takes a predicate, e.g. to skip applied versions.
 
 The migrator takes a [`Bookkeeping`] target (database + table). It runs
 `CREATE DATABASE IF NOT EXISTS` for the bookkeeping database and fully-qualifies

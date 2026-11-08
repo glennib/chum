@@ -1,5 +1,6 @@
 //! Error type for the migrator.
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 use crate::migration::Direction;
@@ -234,6 +235,24 @@ pub enum ChumError {
     )]
     Render(Vec<RenderFailure>),
 
+    /// One or more templates have mistakes that don't depend on the supplied
+    /// values: a syntax error, an unknown filter or test, or a chum filter
+    /// called with the wrong arguments, in any branch. Found without rendering;
+    /// nothing was executed.
+    #[error("{}", failures_message(&check_headline(.0), .0))]
+    #[cfg_attr(
+        feature = "diagnostic",
+        diagnostic(
+            code(chum::check),
+            help(
+                "Fix the template file. These mistakes are found in every branch, whatever values \
+                 are supplied, so the file fails wherever such a line is reached; `chum check` \
+                 lists them without connecting to ClickHouse."
+            )
+        )
+    )]
+    Check(Vec<RenderFailure>),
+
     /// A supplied `this.*` value differs from the one recorded when the
     /// version was applied. In `revert` and `force` the recorded value
     /// describes what actually ran, so it wins, and a different supplied
@@ -298,7 +317,8 @@ pub enum ChumError {
     TemplatingDisabled(String),
 }
 
-/// Why one migration failed to render, as part of [`ChumError::Render`].
+/// Why one migration failed to render or check, as part of
+/// [`ChumError::Render`] or [`ChumError::Check`].
 ///
 /// With the `diagnostic` feature it is a [`miette::Diagnostic`] whose source
 /// code is the template, labelled at [`RenderFailure::location`], so a
@@ -467,6 +487,18 @@ fn render_headline(failures: &[RenderFailure]) -> String {
     format!("failed to render {}", plural(failures.len(), "migration"))
 }
 
+fn check_headline(failures: &[RenderFailure]) -> String {
+    let migrations: BTreeSet<(i64, &str)> = failures
+        .iter()
+        .map(|f| (f.version, f.direction.as_str()))
+        .collect();
+    format!(
+        "{} in {}",
+        plural(failures.len(), "template mistake"),
+        plural(migrations.len(), "migration")
+    )
+}
+
 fn failures_message(headline: &str, failures: &[RenderFailure]) -> String {
     let mut out = format!("{headline}:");
     for failure in failures {
@@ -498,7 +530,10 @@ fn render_help(failures: &[RenderFailure]) -> String {
         );
     }
     if has(RenderFailureKind::Template) {
-        sentences.push("Fix the template file: the mistake doesn't depend on the supplied values.");
+        sentences.push(
+            "Fix the template file: the mistake doesn't depend on the supplied values. `chum \
+             check` finds such mistakes in every branch of every template.",
+        );
     }
     sentences
         .push("`chum render` shows what a migration renders to without connecting to ClickHouse.");

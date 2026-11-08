@@ -547,6 +547,19 @@ enum Command {
         #[command(flatten)]
         var: VarArgs,
     },
+    /// Check every template for mistakes, without values or a connection.
+    ///
+    /// Finds syntax errors and, in every branch, unknown filters and tests and
+    /// chum filters called with the wrong arguments. Rendering finds these
+    /// only in the branches the supplied values take, so a mistake behind
+    /// `{% if this.cutoff is defined %}` would otherwise surface first where a
+    /// cutoff is supplied.
+    Check {
+        /// Check only templates from this version on, e.g. to skip applied
+        /// ones that can no longer change.
+        #[arg(long)]
+        from: Option<i64>,
+    },
     /// Scaffold a new `up`/`down` migration pair in the source directory.
     Add {
         /// Short name (e.g. `add_users_table`).
@@ -616,6 +629,7 @@ impl Command {
             | Command::Render { var, .. }
             | Command::Force { var, .. } => &var.vars,
             Command::Info
+            | Command::Check { .. }
             | Command::Add { .. }
             | Command::Convert { .. }
             | Command::Reset { .. } => &[],
@@ -650,12 +664,16 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Re-report a render failure with each failing template as a
+/// Re-report a render or check failure with each failing template as a
 /// related diagnostic, so the report shows the line and underlines the
 /// expression. Other errors are returned as they are.
 fn template_report(report: miette::Report) -> miette::Report {
     let failures = match report.downcast_ref::<chum::ChumError>() {
-        Some(chum::ChumError::Render(f)) if f.iter().any(|f| f.location.is_some()) => f.clone(),
+        Some(chum::ChumError::Render(f) | chum::ChumError::Check(f))
+            if f.iter().any(|f| f.location.is_some()) =>
+        {
+            f.clone()
+        }
         _ => return report,
     };
     let diagnostic: &dyn miette::Diagnostic = report.as_ref();
@@ -753,6 +771,11 @@ async fn run(cli: Cli) -> miette::Result<()> {
     }
     if let Command::Convert { to, dry_run } = &cli.command {
         return run_convert(&cli.source, *to, *dry_run, fmt);
+    }
+    // `check` needs neither variables nor a connection.
+    if let Command::Check { from } = &cli.command {
+        let migrator = Migrator::new(source::from_path(&cli.source)?);
+        return run_check(&migrator, *from, fmt);
     }
 
     let flags = cli.var.vars.iter().chain(cli.command.vars()).cloned();
@@ -878,7 +901,10 @@ async fn run(cli: Cli) -> miette::Result<()> {
                 render_reset(version, fmt)?;
             }
         }
-        Command::Add { .. } | Command::Convert { .. } | Command::Render { .. } => {
+        Command::Add { .. }
+        | Command::Convert { .. }
+        | Command::Check { .. }
+        | Command::Render { .. } => {
             unreachable!("handled above")
         }
     }
@@ -938,6 +964,19 @@ fn namespaced_for(key: &chum::VarKey) -> String {
         chum::VarKey::Env(_) => key.namespaced(),
         chum::VarKey::This { version, .. } => format!("{} of version {version}", key.namespaced()),
     }
+}
+
+/// `chum check`: check the selected templates and report how many there were.
+fn run_check(migrator: &Migrator, from: Option<i64>, fmt: Resolved) -> miette::Result<()> {
+    let selected = |m: &chum::Migration| m.template && from.is_none_or(|from| m.version >= from);
+    migrator.check_matching(selected)?;
+    let checked = migrator.migrations().iter().filter(|m| selected(m)).count();
+    match fmt {
+        Resolved::Pretty => println!("{} checked {}", check(), count(checked, "template")),
+        Resolved::Json => print_json(&CheckOut { checked })?,
+        Resolved::Tsv => print_tsv(&["checked"], &[vec![checked.to_string()]]),
+    }
+    Ok(())
 }
 
 /// `chum render`: pick the migrations, render them, and print them.
@@ -1049,6 +1088,12 @@ struct VersionOut {
 struct AddOut {
     up: String,
     down: String,
+}
+
+#[derive(Serialize)]
+struct CheckOut {
+    /// How many template files were checked.
+    checked: usize,
 }
 
 #[derive(Serialize)]
@@ -2248,6 +2293,15 @@ mod tests {
     }
 
     #[test]
+    fn check_takes_an_optional_from() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from(["chum", "check"]).expect("bare");
+        assert!(matches!(cli.command, Command::Check { from: None }));
+        let cli = Cli::try_parse_from(["chum", "check", "--from", "5"]).expect("from");
+        assert!(matches!(cli.command, Command::Check { from: Some(5) }));
+    }
+
+    #[test]
     fn template_report_relates_each_located_failure() {
         let text = "SELECT {{ x | nope }}".to_owned();
         let failure = chum::RenderFailure::new(
@@ -2257,13 +2311,13 @@ mod tests {
             Vec::new(),
         )
         .with_location(Some(chum::TemplateLocation::new("t".into(), text, 14..18)));
-        let report = template_report(miette::Report::new(chum::ChumError::Render(vec![
+        let report = template_report(miette::Report::new(chum::ChumError::Check(vec![
             failure.clone(),
             failure,
         ])));
         let diagnostic: &dyn miette::Diagnostic = report.as_ref();
-        assert_eq!(report.to_string(), "failed to render 2 migrations");
-        assert_eq!(diagnostic.code().unwrap().to_string(), "chum::render");
+        assert_eq!(report.to_string(), "2 template mistakes in 1 migration");
+        assert_eq!(diagnostic.code().unwrap().to_string(), "chum::check");
         assert!(diagnostic.help().is_some());
         assert_eq!(diagnostic.related().unwrap().count(), 2);
 
