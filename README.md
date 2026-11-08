@@ -584,11 +584,11 @@ statements, then writes a `success = true` marker. The latest state per version
 is read with `argMax(col, seq)`, where `seq` is a server-assigned nanosecond
 counter (this also leaves a full audit trail of every attempt). If an apply
 fails partway, the latest marker stays `false` and the version reads as
-**dirty** until resolved (fix the schema by hand, then `chum force <version>`;
-or, if the attempt changed nothing, `chum reset <version>` to make it pending
-again). A revert likewise writes a `success = false` marker before running the
-down migration and deletes the version's rows once it finishes, so a revert that
-fails partway also leaves the version dirty. Finish the revert by hand and run
+**dirty** until resolved: undo what the attempt did (if anything) and run
+`chum reset <version>` to make it pending again, or finish it by hand and run
+`chum force <version>`. A revert likewise writes a `success = false` marker
+before running the down migration and deletes the version's rows once it
+finishes, so a revert that fails partway also leaves the version dirty. Finish the revert by hand and run
 `chum reset <version>`, or restore the version and run `chum force <version>`.
 The error names the failing statement and its position in the file.
 

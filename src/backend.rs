@@ -37,7 +37,7 @@
 //! 3. append a `success = true` marker with the elapsed time.
 //!
 //! If step 2 fails partway, the latest marker stays `success = false` and the
-//! version reads as dirty until resolved with `chum force`.
+//! version reads as dirty until resolved with `chum reset` or `chum force`.
 //!
 //! # Cross-replica consistency
 //!

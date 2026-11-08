@@ -90,20 +90,22 @@ pub enum ChumError {
     ChecksumMismatch(i64),
 
     /// The database is dirty: a previous apply failed partway and the version
-    /// must be resolved (e.g. with `chum force`) before continuing.
+    /// must be resolved (with `chum reset` or `chum force`) before continuing.
     #[error(
-        "database is dirty at version {0}: a previous migration failed partway; resolve the \
-         schema and run `chum force {0}`"
+        "database is dirty at version {0}: a previous migration failed partway; undo what it did \
+         and run `chum reset {0}` to apply it again, or finish it by hand and run `chum force {0}`"
     )]
     #[cfg_attr(
         feature = "diagnostic",
         diagnostic(
             code(chum::dirty),
             help(
-                "`chum force <version>` only updates chum's bookkeeping — it does not roll back \
-                 the partial change. Inspect the schema and finish or undo it by hand before \
-                 forcing. If the failed attempt changed nothing (e.g. a guard rejected its \
-                 inputs), `chum reset <version>` makes the version pending again."
+                "Both commands only update chum's bookkeeping; neither rolls back the partial \
+                 change. `chum reset <version>` makes the version pending, so the next `chum run` \
+                 applies it afresh: use it when the failed attempt changed nothing (e.g. a guard \
+                 rejected its inputs, or the first statement failed) or you have undone it. \
+                 `chum force <version>` records the version as applied without running it. Make \
+                 the schema match before running either."
             )
         )
     )]
@@ -567,8 +569,8 @@ fn statement_help(version: i64, direction: Direction, index: usize) -> String {
     };
     let resolve = match direction {
         Direction::Up => format!(
-            "finish the migration by hand and run `chum force {version}`, or undo what it did and \
-             run `chum reset {version}` to apply it again"
+            "undo what it did and run `chum reset {version}` to apply it again, or finish the \
+             migration by hand and run `chum force {version}`"
         ),
         Direction::Down => format!(
             "finish the revert by hand and run `chum reset {version}`, or restore what it removed \
@@ -643,7 +645,14 @@ mod tests {
         );
         let third = statement_help(7, Direction::Up, 3);
         assert!(third.contains("statements 1 to 2, which ran"), "{third}");
-        assert!(third.contains("`chum force 7`"), "{third}");
+        assert!(
+            third.contains("undo what it did and run `chum reset 7`"),
+            "{third}"
+        );
+        assert!(
+            third.find("chum reset 7") < third.find("chum force 7"),
+            "{third}"
+        );
         let down = statement_help(7, Direction::Down, 2);
         assert!(down.contains("statement 1, which ran"), "{down}");
         assert!(
