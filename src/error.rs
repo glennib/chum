@@ -233,7 +233,7 @@ pub enum ChumError {
         diagnostic(
             code(chum::render),
             help(
-                "Supply each missing value with `--var <key>=<value>` or \
+                "Supply each missing or invalid value with `--var <key>=<value>` or \
                  `CHUM_VAR_<key>=<value>`: a plain key (`tier`) for `env.tier`, a version-prefixed \
                  key (`<version>_cutoff`) for `this.cutoff`. `chum render` shows what a \
                  migration renders to without connecting to ClickHouse."
