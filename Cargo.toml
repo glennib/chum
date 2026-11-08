@@ -74,8 +74,8 @@ tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
-too-many-lines = "allow"
-doc-markdown = "allow"
+too_many_lines = "allow"
+doc_markdown = "allow"
 
 # The profile that 'dist' will build with
 [profile.dist]
