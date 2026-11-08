@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/glennib/chum/compare/v0.4.1...v0.5.0) - 2026-11-08
+
+### Fixed
+
+- *(diagnostic)* suggest `chum reset` before `chum force` for a dirty apply
+- *(cli)* [**breaking**] offer each flag only on the subcommands that use it
+
 ## [0.4.1](https://github.com/glennib/chum/compare/v0.4.0...v0.4.1) - 2026-11-08
 
 ### Added
