@@ -419,6 +419,7 @@ variables:
 | `--password` | *(none)* | — | Overrides the password in the URL. Explicit flag or DSN only — **not** read from the environment. |
 | `--table` | `CHUM_TABLE` | `_chum_migrations` | Bookkeeping table name |
 | `--bookkeeping-database` | `CHUM_BOOKKEEPING_DATABASE` | `_chum` | Dedicated database holding the bookkeeping table; chum creates it |
+| `--strict-consistency` | `CHUM_STRICT_CONSISTENCY` | off | Apply the [cross-replica consistency](#cross-replica-consistency) settings |
 | `--source` | `CHUM_SOURCE` | `migrations` | Migration directory |
 | `--format` | — | `auto` | `auto` \| `pretty` \| `json` \| `tsv` (`auto` = table on a tty, TSV when piped) |
 | `--json` | — | — | Shorthand for `--format json` |
@@ -604,8 +605,8 @@ version, or start from a fresh database).
 The append-only + `argMax` scheme is correct regardless of merge timing *within
 a node*. To also get read-after-write *across replicas* — so a later command,
 even routed to a different replica behind a load-balanced endpoint, reliably
-sees what an earlier one wrote — `chum` applies a bundle of session settings
-client-wide on every connection:
+sees what an earlier one wrote — `--strict-consistency` makes `chum` apply a
+bundle of session settings client-wide on its connection:
 
 | Setting | Purpose |
 | --- | --- |
@@ -615,9 +616,11 @@ client-wide on every connection:
 
 These need no table-DDL or cluster-config change — replication itself is
 supplied by the `Replicated` database engine. On a single node they are inert
-no-ops. The cross-replica guarantees are documented ClickHouse behavior but are
-**not yet exercised against the Aiven cluster**. Any of them can be overridden
-with a `?setting=value` query param on `--url`.
+no-ops. The bundle is off by default: on the managed Aiven cluster, the
+`insert_quorum` settings made every bookkeeping `INSERT` block until
+`insert_quorum_timeout`. Enable it only where it is known to work and the
+guarantee is needed. Any of the settings can be overridden with a
+`?setting=value` query param on `--url`.
 
 ## Tests
 
