@@ -24,6 +24,11 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 
+use chrono::DateTime;
+use chrono::NaiveDate;
+use chrono::Timelike;
+use chrono::Utc;
+
 use minijinja::AutoEscape;
 use minijinja::Environment;
 use minijinja::Error;
@@ -74,6 +79,9 @@ fn environment() -> Environment<'static> {
     );
     env.add_filter("sql_string", sql_string);
     env.add_filter("sql_ident", sql_ident);
+    env.add_filter("sql_date", sql_date);
+    env.add_filter("sql_datetime", sql_datetime);
+    env.add_filter("sql_datetime64", sql_datetime64);
     env
 }
 
@@ -209,6 +217,135 @@ fn sql_ident(value: String) -> String {
     }
     out.push('`');
     out
+}
+
+// The date and time filters render an expression of exactly one ClickHouse
+// type, or fail when the value doesn't fit it exactly. ClickHouse clamps an
+// out-of-range value rather than rejecting it, and where it clamps differs
+// between server versions, so the ranges are checked here. The rendered
+// string is always `YYYY-MM-DD hh:mm:ss[.fff]` with an explicit `'UTC'`: the
+// only form that every server version parses the same way, whatever its
+// `cast_string_to_date_time_mode`.
+
+/// `{{ value | sql_date }}`: `toDate('2026-11-10')`, from a `YYYY-MM-DD` date
+/// between 1970-01-01 and 2149-06-06.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "minijinja checks only owned `String` arguments for undefined"
+)]
+fn sql_date(value: String) -> Result<String, Error> {
+    let date = NaiveDate::parse_from_str(&value, "%Y-%m-%d")
+        .ok()
+        // `%Y` and `%m` also accept a sign and unpadded numbers.
+        .filter(|date| date.format("%Y-%m-%d").to_string() == value)
+        .ok_or_else(|| invalid(format!("{value:?} is not a date in the form YYYY-MM-DD")))?;
+    let min = NaiveDate::from_ymd_opt(1970, 1, 1).expect("a valid date");
+    let max = NaiveDate::from_ymd_opt(2149, 6, 6).expect("a valid date");
+    if !(min..=max).contains(&date) {
+        return Err(invalid(format!(
+            "{value:?} is outside the range of Date, 1970-01-01 to 2149-06-06"
+        )));
+    }
+    Ok(format!("toDate('{value}')"))
+}
+
+/// `{{ value | sql_datetime }}`: `toDateTime('2026-11-10 08:00:00', 'UTC')`,
+/// from an RFC 3339 date-time with an offset and no fractional seconds,
+/// between 1970-01-01 00:00:00 and 2106-02-07 06:28:15 UTC.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "minijinja checks only owned `String` arguments for undefined"
+)]
+fn sql_datetime(value: String) -> Result<String, Error> {
+    let time = parse_rfc3339(&value)?;
+    if time.nanosecond() != 0 {
+        return Err(invalid(format!(
+            "{value:?} has fractional seconds, which DateTime can't hold; use sql_datetime64"
+        )));
+    }
+    if !(0..=i64::from(u32::MAX)).contains(&time.timestamp()) {
+        return Err(invalid(format!(
+            "{value:?} is outside the range of DateTime, \
+             1970-01-01 00:00:00 to 2106-02-07 06:28:15 UTC"
+        )));
+    }
+    Ok(format!(
+        "toDateTime('{}', 'UTC')",
+        time.format("%Y-%m-%d %H:%M:%S")
+    ))
+}
+
+/// `{{ value | sql_datetime64(3) }}`:
+/// `toDateTime64('2026-11-10 08:00:00.123', 3, 'UTC')`, from an RFC 3339
+/// date-time with an offset and at most `precision` fractional digits,
+/// between 1900-01-01 and 2299-12-31 UTC (2262-04-11 23:47:16.854775807 at
+/// precision 9, where the value is i64 nanoseconds).
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "minijinja checks only owned `String` arguments for undefined"
+)]
+fn sql_datetime64(value: String, precision: u32) -> Result<String, Error> {
+    if precision > 9 {
+        return Err(invalid(format!(
+            "DateTime64 precision must be 0 to 9, not {precision}"
+        )));
+    }
+    let time = parse_rfc3339(&value)?;
+    let unit = 10_u32.pow(9 - precision);
+    if time.nanosecond() % unit != 0 {
+        return Err(invalid(format!(
+            "{value:?} has more fractional digits than DateTime64({precision}) holds"
+        )));
+    }
+    let min = "1900-01-01T00:00:00Z"
+        .parse::<DateTime<Utc>>()
+        .expect("valid");
+    let end = "2300-01-01T00:00:00Z"
+        .parse::<DateTime<Utc>>()
+        .expect("valid");
+    if time < min || time >= end || (precision == 9 && time.timestamp_nanos_opt().is_none()) {
+        let max = if precision == 9 {
+            "2262-04-11 23:47:16.854775807"
+        } else {
+            "2299-12-31 23:59:59"
+        };
+        return Err(invalid(format!(
+            "{value:?} is outside the range of DateTime64({precision}), \
+             1900-01-01 00:00:00 to {max} UTC"
+        )));
+    }
+    let fraction = if precision == 0 {
+        String::new()
+    } else {
+        let width = precision as usize;
+        format!(".{:0width$}", time.nanosecond() / unit)
+    };
+    Ok(format!(
+        "toDateTime64('{}{fraction}', {precision}, 'UTC')",
+        time.format("%Y-%m-%d %H:%M:%S")
+    ))
+}
+
+/// Parse an RFC 3339 date-time, which always carries an offset (`Z` or
+/// `±hh:mm`), into UTC.
+fn parse_rfc3339(value: &str) -> Result<DateTime<Utc>, Error> {
+    let time = DateTime::parse_from_rfc3339(value).map_err(|err| {
+        invalid(format!(
+            "{value:?} is not an RFC 3339 date-time with an offset, \
+             such as 2026-11-10T09:00:00Z: {err}"
+        ))
+    })?;
+    // chrono represents a leap second as a nanosecond count past one second.
+    if time.nanosecond() >= 1_000_000_000 {
+        return Err(invalid(format!(
+            "{value:?} is a leap second, which ClickHouse can't represent"
+        )));
+    }
+    Ok(time.with_timezone(&Utc))
+}
+
+fn invalid(message: String) -> Error {
+    Error::new(ErrorKind::InvalidOperation, message)
 }
 
 #[derive(Debug, Default)]
@@ -387,6 +524,9 @@ mod tests {
             "{% if env.x %}{% endif %}",
             "{{ env.x | sql_string }}",
             "{{ env.x | sql_ident }}",
+            "{{ env.x | sql_date }}",
+            "{{ env.x | sql_datetime }}",
+            "{{ env.x | sql_datetime64(3) }}",
         ] {
             let f = err(source, &[], &[]);
             assert!(f.message.contains("undefined"), "{source}: {}", f.message);
@@ -537,6 +677,181 @@ mod tests {
         assert_eq!(stmts.len(), 2);
     }
 
+    /// Render `{{ this.x | <filter> }}` with `x = value`.
+    fn filtered(filter: &str, value: &str) -> Result<String, String> {
+        render(
+            "t",
+            &format!("{{{{ this.x | {filter} }}}}"),
+            &BTreeMap::new(),
+            &map(&[("x", value)]),
+        )
+        .map(|r| r.sql)
+        .map_err(|f| f.message)
+    }
+
+    #[track_caller]
+    fn rejects(filter: &str, value: &str, reason: &str) {
+        let message = filtered(filter, value).expect_err(value);
+        assert!(message.contains(reason), "{filter} {value:?}: {message}");
+    }
+
+    #[test]
+    fn sql_date_is_a_date_literal() {
+        for (value, sql) in [
+            ("2026-11-10", "toDate('2026-11-10')"),
+            ("1970-01-01", "toDate('1970-01-01')"),
+            ("2149-06-06", "toDate('2149-06-06')"),
+        ] {
+            assert_eq!(filtered("sql_date", value).as_deref(), Ok(sql));
+        }
+        for value in [
+            "2026-11-10T00:00:00Z",
+            "2026-11-10 00:00:00",
+            "2026-1-5",
+            "+2026-11-10",
+            "2026-02-30",
+            "10/11/2026",
+            "",
+        ] {
+            rejects("sql_date", value, "is not a date in the form YYYY-MM-DD");
+        }
+        for value in ["1969-12-31", "2149-06-07"] {
+            rejects("sql_date", value, "outside the range of Date");
+        }
+    }
+
+    #[test]
+    fn sql_datetime_is_a_utc_datetime_literal() {
+        for (value, sql) in [
+            (
+                "2026-11-10T09:00:00Z",
+                "toDateTime('2026-11-10 09:00:00', 'UTC')",
+            ),
+            (
+                "2026-11-10 09:00:00z",
+                "toDateTime('2026-11-10 09:00:00', 'UTC')",
+            ),
+            (
+                "2026-11-10T09:00:00+01:00",
+                "toDateTime('2026-11-10 08:00:00', 'UTC')",
+            ),
+            (
+                "2026-11-10T00:30:00+01:00",
+                "toDateTime('2026-11-09 23:30:00', 'UTC')",
+            ),
+            (
+                "2026-11-10T09:00:00.000Z",
+                "toDateTime('2026-11-10 09:00:00', 'UTC')",
+            ),
+            (
+                "1970-01-01T00:00:00Z",
+                "toDateTime('1970-01-01 00:00:00', 'UTC')",
+            ),
+            (
+                "2106-02-07T06:28:15Z",
+                "toDateTime('2106-02-07 06:28:15', 'UTC')",
+            ),
+        ] {
+            assert_eq!(filtered("sql_datetime", value).as_deref(), Ok(sql));
+        }
+        for value in [
+            "2026-11-10 09:00:00",
+            "2026-11-10",
+            "2026-11",
+            "1762765200",
+            "now",
+        ] {
+            rejects("sql_datetime", value, "is not an RFC 3339 date-time");
+        }
+        rejects(
+            "sql_datetime",
+            "2026-11-10T09:00:00.5Z",
+            "use sql_datetime64",
+        );
+        rejects("sql_datetime", "2016-12-31T23:59:60Z", "leap second");
+        for value in ["1969-12-31T23:59:59Z", "2106-02-07T06:28:16Z"] {
+            rejects("sql_datetime", value, "outside the range of DateTime");
+        }
+    }
+
+    #[test]
+    fn sql_datetime64_keeps_exactly_its_precision() {
+        let sql = |filter: &str, value: &str| filtered(filter, value).unwrap();
+        assert_eq!(
+            sql("sql_datetime64(3)", "2026-11-10T09:00:00.123+01:00"),
+            "toDateTime64('2026-11-10 08:00:00.123', 3, 'UTC')"
+        );
+        assert_eq!(
+            sql("sql_datetime64(3)", "2026-11-10T09:00:00.5Z"),
+            "toDateTime64('2026-11-10 09:00:00.500', 3, 'UTC')"
+        );
+        assert_eq!(
+            sql("sql_datetime64(6)", "2026-11-10T09:00:00.000042Z"),
+            "toDateTime64('2026-11-10 09:00:00.000042', 6, 'UTC')"
+        );
+        assert_eq!(
+            sql("sql_datetime64(0)", "2026-11-10T09:00:00Z"),
+            "toDateTime64('2026-11-10 09:00:00', 0, 'UTC')"
+        );
+        assert_eq!(
+            sql("sql_datetime64(3)", "1900-01-01T00:00:00Z"),
+            "toDateTime64('1900-01-01 00:00:00.000', 3, 'UTC')"
+        );
+        assert_eq!(
+            sql("sql_datetime64(2)", "1960-05-01T12:00:00.25Z"),
+            "toDateTime64('1960-05-01 12:00:00.25', 2, 'UTC')"
+        );
+        assert_eq!(
+            sql("sql_datetime64(8)", "2299-12-31T23:59:59.99999999Z"),
+            "toDateTime64('2299-12-31 23:59:59.99999999', 8, 'UTC')"
+        );
+        assert_eq!(
+            sql("sql_datetime64(9)", "2262-04-11T23:47:16.854775807Z"),
+            "toDateTime64('2262-04-11 23:47:16.854775807', 9, 'UTC')"
+        );
+
+        rejects(
+            "sql_datetime64(3)",
+            "2026-11-10T09:00:00.1234Z",
+            "than DateTime64(3) holds",
+        );
+        rejects(
+            "sql_datetime64(0)",
+            "2026-11-10T09:00:00.5Z",
+            "than DateTime64(0) holds",
+        );
+        rejects(
+            "sql_datetime64(3)",
+            "2026-11-10 09:00:00",
+            "is not an RFC 3339 date-time",
+        );
+        rejects(
+            "sql_datetime64(10)",
+            "2026-11-10T09:00:00Z",
+            "precision must be 0 to 9",
+        );
+        for (filter, value) in [
+            ("sql_datetime64(3)", "1899-12-31T23:59:59Z"),
+            ("sql_datetime64(3)", "2300-01-01T00:00:00Z"),
+            ("sql_datetime64(9)", "2262-04-11T23:47:16.854775808Z"),
+        ] {
+            rejects(filter, value, "outside the range of DateTime64");
+        }
+        // The precision is required, as it is in the ClickHouse type.
+        assert!(filtered("sql_datetime64", "2026-11-10T09:00:00Z").is_err());
+    }
+
+    #[test]
+    fn datetime_literals_split_as_one_statement() {
+        let r = ok(
+            "SELECT {{ this.d | sql_date }}, {{ this.t | sql_datetime }}, \
+             {{ this.t | sql_datetime64(3) }}; SELECT 1",
+            &[],
+            &[("d", "2026-11-10"), ("t", "2026-11-10T09:00:00Z")],
+        );
+        assert_eq!(statements(&r).len(), 2);
+    }
+
     #[test]
     fn references_are_found_statically() {
         let refs = references(
@@ -618,7 +933,7 @@ ORDER BY (user_id, ts)";
 
     const MV_UP: &str = "{% if this.cutoff is defined %}
 SELECT throwIf(
-    toDateTime({{ this.cutoff | sql_string }}, 'UTC') <= now()
+    {{ this.cutoff | sql_datetime }} <= now()
         AND (SELECT count() FROM app.events) > 0,
     'cutoff must be in the future while app.events has data'
 );
@@ -634,14 +949,14 @@ TO app.events_hourly AS
 SELECT toStartOfHour(ts) AS hour, count() AS events
 FROM app.events
 {% if this.cutoff is defined %}
-WHERE ts >= toDateTime({{ this.cutoff | sql_string }}, 'UTC')
+WHERE ts >= {{ this.cutoff | sql_datetime }}
 {% endif %}
 GROUP BY hour;
 ";
 
     #[test]
     fn example_materialized_view_with_a_cutoff() {
-        let with = ok(MV_UP, &[], &[("cutoff", "2026-11-10 09:00:00")]);
+        let with = ok(MV_UP, &[], &[("cutoff", "2026-11-10T09:00:00Z")]);
         assert_eq!(
             statements(&with),
             [
@@ -660,7 +975,7 @@ WHERE ts >= toDateTime('2026-11-10 09:00:00', 'UTC')
 GROUP BY hour"
             ]
         );
-        assert_eq!(with.used, map(&[("this.cutoff", "2026-11-10 09:00:00")]));
+        assert_eq!(with.used, map(&[("this.cutoff", "2026-11-10T09:00:00Z")]));
 
         let without = ok(MV_UP, &[], &[]);
         assert_eq!(

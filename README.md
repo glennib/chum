@@ -155,6 +155,28 @@ Values are strings. Two filters quote them for SQL:
 - `sql_ident` renders a backquoted identifier (`` `my db` ``), for database,
   table and column names.
 
+Three filters parse a date or time and render an expression of exactly one
+ClickHouse type, so a value is checked when chum renders it (`chum render`
+shows the error) rather than parsed by the server:
+
+| Filter | Value | Renders |
+|---|---|---|
+| `sql_date` | `2026-11-10` | `toDate('2026-11-10')` |
+| `sql_datetime` | `2026-11-10T09:00:00+01:00` | `toDateTime('2026-11-10 08:00:00', 'UTC')` |
+| `sql_datetime64(3)` | `2026-11-10T09:00:00.123Z` | `toDateTime64('2026-11-10 09:00:00.123', 3, 'UTC')` |
+
+`sql_date` takes a `YYYY-MM-DD` date. The other two take an RFC 3339 date-time,
+with `T` or a space between date and time, and require an offset (`Z` or
+`±hh:mm`): a time without one is rejected rather than guessed to be UTC. They
+convert it to UTC. A value that the type can't hold exactly is an error rather
+than truncated or clamped: a time of day for `sql_date`, fractional seconds for
+`sql_datetime`, more fractional digits than the precision for `sql_datetime64`,
+and anything outside the type's range (`Date` 1970-01-01 to 2149-06-06,
+`DateTime` 1970 to 2106-02-07 06:28:15, `DateTime64` 1900 to 2299, or
+2262-04-11 at precision 9). The rendered form parses the same on every
+ClickHouse version, unlike `toDateTime({{ x | sql_string }})`, whose accepted
+formats depend on the server's `cast_string_to_date_time_mode`.
+
 An unfiltered `{{ env.x }}` inserts the value verbatim, which is right for
 numbers and SQL fragments. Compare values (`{% if env.tier == "prod" %}`)
 rather than testing their truthiness: every non-empty string is true, `"false"`
@@ -266,7 +288,7 @@ migration on its own day, with its own cutoff:
 -- 20261106120000_events_hourly_mv.up.sql.j2
 {% if this.cutoff is defined %}
 SELECT throwIf(
-    toDateTime({{ this.cutoff | sql_string }}, 'UTC') <= now()
+    {{ this.cutoff | sql_datetime }} <= now()
         AND (SELECT count() FROM app.events) > 0,
     'cutoff must be in the future while app.events has data'
 );
@@ -282,7 +304,7 @@ TO app.events_hourly AS
 SELECT toStartOfHour(ts) AS hour, count() AS events
 FROM app.events
 {% if this.cutoff is defined %}
-WHERE ts >= toDateTime({{ this.cutoff | sql_string }}, 'UTC')
+WHERE ts >= {{ this.cutoff | sql_datetime }}
 {% endif %}
 GROUP BY hour;
 ```
@@ -297,7 +319,7 @@ rebuilt database), the view covers everything from the start, there is nothing
 to backfill, and any cutoff or none is accepted.
 
 ```bash
-chum --url "$STAGING_URL" run --var 20261106120000_cutoff='2026-11-06 14:00:00'
+chum --url "$STAGING_URL" run --var 20261106120000_cutoff=2026-11-06T14:00:00Z
 ```
 
 Where chum runs as a Kubernetes Job, the release that ships the migration adds
@@ -306,7 +328,9 @@ the version is applied, but `revert`, `force` and the guard in a rebuilt
 database still see it, so remove it once every environment has applied the
 migration. After the cutoff has passed, the backfill reads that environment's
 cutoff with the `chum info` query above and inserts `WHERE ts < cutoff`; no
-recorded cutoff means the table was empty and there is nothing to backfill.
+recorded cutoff means the table was empty and there is nothing to backfill. The
+recorded value is the string as given, such as `2026-11-06T14:00:00Z`, which
+`parseDateTimeBestEffort(cutoff, 'UTC')` reads on any ClickHouse version.
 
 ## CLI
 
