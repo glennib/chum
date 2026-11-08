@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/glennib/chum/compare/v0.4.0...v0.4.1) - 2026-11-08
+
+### Added
+
+- check every branch of every template before rendering, and add `chum check`
+- say whether a render failure is the template's or a value's fault
+- *(template)* add sql_date, sql_datetime and sql_datetime64 filters
+
+### Fixed
+
+- *(error)* mention invalid values in the render error's help
+
+### Other
+
+- document --strict-consistency
+- use underscore names for clippy lint overrides
+
 ## [0.4.0](https://github.com/glennib/chum/compare/v0.3.0...v0.4.0) - 2026-11-06
 
 ### Added
