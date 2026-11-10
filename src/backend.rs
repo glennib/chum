@@ -69,6 +69,7 @@
 //! cluster.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use crate::error::ChumError;
 use crate::error::Result;
@@ -151,6 +152,7 @@ struct AppliedRow {
     success: bool,
     succeeded_before: bool,
     vars: Vec<(String, String)>,
+    unset: Vec<String>,
 }
 
 /// Create the bookkeeping database if it does not already exist.
@@ -192,7 +194,8 @@ pub async fn ensure_table(client: &clickhouse::Client, bookkeeping: &Bookkeeping
              success      Bool,
              applied_at   DateTime64(3, 'UTC') DEFAULT now64(3),
              seq          UInt64,
-             vars         Map(String, String)
+             vars         Map(String, String),
+             unset        Array(String)
          )
          ENGINE = MergeTree
          ORDER BY (version, seq)"
@@ -201,14 +204,37 @@ pub async fn ensure_table(client: &clickhouse::Client, bookkeeping: &Bookkeeping
     Ok(())
 }
 
-/// The statement that adds the `vars` column to a bookkeeping table created
-/// before chum recorded variables.
+/// The columns added after the bookkeeping table's first release: `vars`
+/// (the recorded variable values) and `unset` (the `this.*` names a version
+/// was applied without).
+const ADDED_COLUMNS: [&str; 2] = ["vars", "unset"];
+
+/// The statement that adds the `vars` and `unset` columns to a bookkeeping
+/// table created by an older chum. It is idempotent.
 #[must_use]
 pub fn upgrade_statement(bookkeeping: &Bookkeeping) -> String {
     format!(
-        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS vars Map(String, String)",
+        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS vars Map(String, String), \
+         ADD COLUMN IF NOT EXISTS unset Array(String)",
         bookkeeping.qualified()
     )
+}
+
+/// Which of [`ADDED_COLUMNS`] the bookkeeping table has.
+async fn added_columns(
+    client: &clickhouse::Client,
+    bookkeeping: &Bookkeeping,
+) -> Result<BTreeSet<String>> {
+    let names: Vec<String> = client
+        .query(
+            "SELECT name FROM system.columns \
+             WHERE database = ? AND table = ? AND name IN ('vars', 'unset')",
+        )
+        .bind(bookkeeping.database())
+        .bind(bookkeeping.table())
+        .fetch_all()
+        .await?;
+    Ok(names.into_iter().collect())
 }
 
 /// Whether the bookkeeping table has the `vars` column.
@@ -220,22 +246,27 @@ pub async fn has_vars_column(
     client: &clickhouse::Client,
     bookkeeping: &Bookkeeping,
 ) -> Result<bool> {
-    let n: u64 = client
-        .query(
-            "SELECT count() FROM system.columns WHERE database = ? AND table = ? AND name = 'vars'",
-        )
-        .bind(bookkeeping.database())
-        .bind(bookkeeping.table())
-        .fetch_one()
-        .await?;
-    Ok(n > 0)
+    Ok(added_columns(client, bookkeeping).await?.contains("vars"))
 }
 
-/// Add the `vars` column to a bookkeeping table that lacks it, returning the
-/// statement that was run, or `None` when the column was already there.
+/// Whether the bookkeeping table has the `unset` column.
+///
+/// # Errors
+///
+/// Returns [`ChumError::ClickHouse`] if the query fails.
+pub async fn has_unset_column(
+    client: &clickhouse::Client,
+    bookkeeping: &Bookkeeping,
+) -> Result<bool> {
+    Ok(added_columns(client, bookkeeping).await?.contains("unset"))
+}
+
+/// Add the `vars` and `unset` columns to a bookkeeping table that lacks
+/// either, returning the statement that was run, or `None` when both were
+/// already there.
 ///
 /// Only commands that write bookkeeping rows call this; read-only commands
-/// read a missing column as empty maps (see [`list_applied`]), so inspecting a
+/// read a missing column as empty (see [`list_applied`]), so inspecting a
 /// database never alters it. The change is additive: an older chum names its
 /// columns on insert and select, so it keeps working against the upgraded
 /// table.
@@ -248,7 +279,8 @@ pub async fn upgrade_table(
     client: &clickhouse::Client,
     bookkeeping: &Bookkeeping,
 ) -> Result<Option<String>> {
-    if has_vars_column(client, bookkeeping).await? {
+    let present = added_columns(client, bookkeeping).await?;
+    if ADDED_COLUMNS.iter().all(|c| present.contains(*c)) {
         return Ok(None);
     }
     let statement = upgrade_statement(bookkeeping);
@@ -265,8 +297,8 @@ pub async fn upgrade_table(
 
 /// Return the latest recorded state of each version, ordered ascending.
 ///
-/// A table without the `vars` column reads every version's variables as
-/// empty.
+/// A table without the `vars` or `unset` column reads every version's values
+/// or unset names as empty. An unset name reads as a `None` value.
 ///
 /// A dirty version with an earlier `success = true` marker reads as
 /// [`reverting`](AppliedMigration::reverting): only a revert appends a `false`
@@ -280,10 +312,16 @@ pub async fn list_applied(
     bookkeeping: &Bookkeeping,
 ) -> Result<Vec<AppliedMigration>> {
     let table = bookkeeping.qualified();
-    let vars = if has_vars_column(client, bookkeeping).await? {
+    let present = added_columns(client, bookkeeping).await?;
+    let vars = if present.contains("vars") {
         "argMax(vars, seq)"
     } else {
         "CAST(map(), 'Map(String, String)')"
+    };
+    let unset = if present.contains("unset") {
+        "argMax(unset, seq)"
+    } else {
+        "CAST([], 'Array(String)')"
     };
     // `bk.success` names the column: a bare `success` inside `max` resolves to
     // the `argMax` alias, which ClickHouse rejects as a nested aggregate.
@@ -295,7 +333,8 @@ pub async fn list_applied(
                 argMax(applied_at, seq)   AS applied_at,
                 argMax(success, seq)      AS success,
                 max(bk.success)           AS succeeded_before,
-                {vars}                    AS vars
+                {vars}                    AS vars,
+                {unset}                   AS unset
          FROM {table} AS bk
          GROUP BY version
          ORDER BY version"
@@ -311,17 +350,23 @@ pub async fn list_applied(
             applied_at: r.applied_at,
             success: r.success,
             reverting: !r.success && r.succeeded_before,
-            vars: r.vars.into_iter().collect(),
+            vars: r
+                .vars
+                .into_iter()
+                .map(|(k, v)| (k, Some(v)))
+                .chain(r.unset.into_iter().map(|k| (k, None)))
+                .collect(),
         })
         .collect())
 }
 
 /// Append a marker row recording an apply attempt or completion of
-/// `migration`, with the variables it used.
+/// `migration`, with the variables it used: values in `vars`, and the names
+/// it was applied without (`None`) in `unset`.
 ///
 /// `applied_at` falls back to its `DEFAULT now64(3)`; `seq` is a server-side
 /// nanosecond counter so the latest marker per version is unambiguous. The
-/// table must have the `vars` column (see [`upgrade_table`]).
+/// table must have the `vars` and `unset` columns (see [`upgrade_table`]).
 ///
 /// # Errors
 ///
@@ -332,7 +377,7 @@ pub async fn record(
     migration: &Migration,
     execution_ms: u64,
     success: bool,
-    vars: &BTreeMap<String, String>,
+    vars: &BTreeMap<String, Option<String>>,
 ) -> Result<()> {
     let marker = Marker {
         version: migration.version,
@@ -375,7 +420,7 @@ struct Marker<'a> {
     checksum: &'a str,
     execution_ms: u64,
     success: bool,
-    vars: &'a BTreeMap<String, String>,
+    vars: &'a BTreeMap<String, Option<String>>,
 }
 
 async fn insert_marker(
@@ -386,15 +431,22 @@ async fn insert_marker(
     let table = bookkeeping.qualified();
     let sql = format!(
         "INSERT INTO {table}
-             (version, description, checksum, execution_ms, success, seq, vars)
+             (version, description, checksum, execution_ms, success, seq, vars, unset)
          SELECT ?, ?, ?, ?, ?, toUnixTimestamp64Nano(now64(9)),
-                CAST(mapFromArrays(?, ?), 'Map(String, String)')"
+                CAST(mapFromArrays(?, ?), 'Map(String, String)'),
+                CAST(?, 'Array(String)')"
     );
     let (keys, values): (Vec<&str>, Vec<&str>) = marker
         .vars
         .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .filter_map(|(k, v)| Some((k.as_str(), v.as_deref()?)))
         .unzip();
+    let unset: Vec<&str> = marker
+        .vars
+        .iter()
+        .filter(|(_, v)| v.is_none())
+        .map(|(k, _)| k.as_str())
+        .collect();
     client
         .query(&sql)
         .bind(marker.version)
@@ -404,6 +456,7 @@ async fn insert_marker(
         .bind(marker.success)
         .bind(keys)
         .bind(values)
+        .bind(unset)
         .execute()
         .await?;
     Ok(())

@@ -249,20 +249,21 @@ and where it came from (`--var`, `--unset`, environment, recorded or default).
 
 Each bookkeeping marker records the values the migration used, as namespaced
 keys (`env.tier`, `this.cutoff`): the values the up looked up while rendering,
-plus every supplied value its down refers to. Values from `| default(…)` aren't
-recorded. `revert` and `force` use them:
+plus every supplied value its down refers to, and the `this.*` names it was
+unset for. Values from `| default(…)` aren't recorded. `revert` and `force` use
+them, so a revert needs nothing supplied again:
 
-- **`this.*`: recorded values win.** A supplied value or unset that differs
-  from the recorded value is an error if the migration being rendered reads that
-  name, and is ignored otherwise, so a stale value left in a deploy spec can't
-  block a migration that doesn't use it. A supplied value or unset for a name
-  that wasn't recorded fills the gap.
+- **`this.*`: recorded values and unsets win.** A supplied value or unset that
+  differs from the recorded one is an error if the migration being rendered
+  reads that name, and is ignored otherwise, so a stale value left in a deploy
+  spec can't block a migration that doesn't use it. A supplied value or unset
+  for a name that wasn't recorded fills the gap.
 - **`env.*`: supplied values win**, since the environment may have changed since
   the apply; recorded values fill gaps, and chum warns when a supplied value
   differs from the recorded one.
 
 `chum info` shows the recorded values in a `vars` column (a `vars` object in
-JSON). For pending templates, JSON output also lists `template_vars`, the
+JSON), with an unset name as `(unset)` (`null` in JSON). For pending templates, JSON output also lists `template_vars`, the
 namespaced names the up template refers to, so you can see what to pass. Read
 recorded values only from an **applied** version, since a dirty marker records a
 failed attempt:
@@ -395,8 +396,8 @@ Where chum runs as a Kubernetes Job, the release that ships the migration adds
 the version is applied, but `revert`, `force` and the guard in a rebuilt
 database still see it, so remove it once every environment has applied the
 migration. After the cutoff has passed, the backfill reads that environment's
-cutoff with the `chum info` query above and inserts `WHERE ts < cutoff`; no
-recorded cutoff means the table was empty and there is nothing to backfill. The
+cutoff with the `chum info` query above and inserts `WHERE ts < cutoff`; an
+unset cutoff means the table was empty and there is nothing to backfill. The
 recorded value is the string as given, such as `2026-11-06T14:00:00Z`, which
 `parseDateTimeBestEffort(cutoff, 'UTC')` reads on any ClickHouse version.
 
@@ -634,12 +635,13 @@ finishes, so a revert that fails partway also leaves the version dirty. Finish t
 The error names the failing statement and its position in the file.
 
 Each marker also records, in a `vars Map(String, String)` column, the template
-variables the migration used (see
+variables the migration used, and in an `unset Array(String)` column the
+`this.*` names it was [unset](#supplied-or-unset) for (see
 [Templated migrations](#when-templates-render-and-which-values-they-get)); plain
-migrations record an empty map. A table created by an older chum lacks the
-column: commands that write markers (`run`, `revert`, `force`) add it with
-`ALTER TABLE … ADD COLUMN IF NOT EXISTS`, and read-only commands treat it as
-empty without altering the table. An older chum keeps working against the
+migrations record them empty. A table created by an older chum lacks one or
+both columns: commands that write markers (`run`, `revert`, `force`) add them
+with `ALTER TABLE … ADD COLUMN IF NOT EXISTS`, and read-only commands treat them
+as empty without altering the table. An older chum keeps working against the
 upgraded table, since it names its columns.
 
 `chum` does **not** adopt databases previously migrated by another tool — an

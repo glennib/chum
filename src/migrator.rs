@@ -47,8 +47,9 @@ pub struct Applied {
     pub description: String,
     /// How long the migration's statements took to execute.
     pub elapsed: Duration,
-    /// The variables recorded for the migration, keyed by namespaced name.
-    pub vars: BTreeMap<String, String>,
+    /// The variables recorded for the migration, keyed by namespaced name,
+    /// with `None` for a `this.*` name it was applied without.
+    pub vars: BTreeMap<String, Option<String>>,
 }
 
 /// The state of a single version, as reported by [`Migrator::info`].
@@ -91,8 +92,9 @@ pub struct Status {
     /// recorded as applied. `None` for pending (and dirty) versions.
     pub execution_ms: Option<u64>,
     /// The variables the latest marker recorded, keyed by namespaced name
-    /// (`env.tier`). Empty for pending versions.
-    pub vars: BTreeMap<String, String>,
+    /// (`env.tier`), with `None` for a `this.*` name the version was applied
+    /// without. Empty for pending versions.
+    pub vars: BTreeMap<String, Option<String>>,
     /// For a pending version whose up migration is a template, the namespaced
     /// names it refers to (`env.tier`, `this.cutoff`), so an operator can see
     /// what to pass. `env.*` or `this.*` means the template reads the whole
@@ -195,22 +197,23 @@ pub enum Progress<'a> {
     },
 }
 
-/// A supplied `this.*` value or unset that differs from the value recorded
-/// for the version, with the namespaced name (`this.cutoff`) and the supplying
-/// key.
+/// A supplied `this.*` value or unset that differs from the one recorded for
+/// the version, with the namespaced name (`this.cutoff`) and the supplying
+/// key. `None` stands for unset.
 struct Conflict {
     name: String,
     key: String,
     supplied: Option<String>,
-    recorded: String,
+    recorded: Option<String>,
 }
 
 /// A migration rendered and split, ready to execute.
 struct Prepared<'a> {
     migration: &'a Migration,
     statements: Vec<String>,
-    /// The variables to record with the migration's markers.
-    record: BTreeMap<String, String>,
+    /// The variables to record with the migration's markers, `None` for an
+    /// unset `this.*` name.
+    record: BTreeMap<String, Option<String>>,
     /// What the migration uses, for [`Planned::vars`].
     used: Vec<UsedVar>,
 }
@@ -561,9 +564,9 @@ impl Migrator {
     /// clearing a dirty state. Used after manually resolving a partial apply.
     ///
     /// The up migration is still rendered, without executing it, so the
-    /// variables it uses are recorded. Values recorded by earlier attempts
-    /// take part as in [`Migrator::undo`]; a version with no rows needs every
-    /// value supplied.
+    /// variables it uses are recorded. Values and unsets recorded by earlier
+    /// attempts take part as in [`Migrator::undo`]; a version with no rows
+    /// needs every value supplied or unset.
     ///
     /// # Errors
     ///
@@ -790,7 +793,7 @@ impl Migrator {
     /// once everything rendered.
     fn prepare<'a, I>(&'a self, migrations: I) -> Result<Vec<Prepared<'a>>>
     where
-        I: IntoIterator<Item = (&'a Migration, Option<&'a BTreeMap<String, String>>)>,
+        I: IntoIterator<Item = (&'a Migration, Option<&'a BTreeMap<String, Option<String>>>)>,
     {
         let migrations: Vec<_> = migrations.into_iter().collect();
         check_all(migrations.iter().map(|(m, _)| *m))?;
@@ -836,7 +839,7 @@ impl Migrator {
                             recorded: c.recorded,
                         });
                     }
-                    rendered.push((migration, env, this, r));
+                    rendered.push((migration, env, this, required, r));
                 }
                 Err(failure) => failures.push(failure),
             }
@@ -846,11 +849,11 @@ impl Migrator {
         }
 
         let mut prepared = Vec::with_capacity(rendered.len());
-        for (migration, env, this, r) in rendered {
+        for (migration, env, this, required, r) in rendered {
             let version = migration.version;
             let statements = split_statements(&r.sql)
                 .map_err(|message| ChumError::Split { version, message })?;
-            prepared.push(self.finish(migration, statements, &env, &this, r));
+            prepared.push(self.finish(migration, statements, &env, &this, &required, r));
         }
         Ok(prepared)
     }
@@ -885,13 +888,15 @@ impl Migrator {
     }
 
     /// Work out what a rendered migration records and uses, and log the
-    /// supplied variables it used.
+    /// supplied variables it used. `required` holds the `this.*` names that
+    /// had to be supplied or unset.
     fn finish<'a>(
         &self,
         migration: &'a Migration,
         statements: Vec<String>,
         env: &BTreeMap<String, Supplied>,
         this: &BTreeMap<String, Supplied>,
+        required: &BTreeSet<String>,
         r: Render,
     ) -> Prepared<'a> {
         let version = migration.version;
@@ -908,7 +913,8 @@ impl Migrator {
             }
         };
 
-        let mut record = r.used;
+        let mut record: BTreeMap<String, Option<String>> =
+            r.used.into_iter().map(|(k, v)| (k, Some(v))).collect();
         // The down migration isn't rendered at apply time, but a revert falls
         // back on recorded values for the names only it uses.
         if migration.direction == Direction::Up
@@ -919,42 +925,40 @@ impl Migrator {
                 if let Some(value) = &s.value
                     && refs.env.contains(name)
                 {
-                    record.insert(format!("env.{name}"), value.clone());
+                    record.insert(format!("env.{name}"), Some(value.clone()));
                 }
             }
             for (name, s) in this {
                 if let Some(value) = &s.value
                     && refs.this.contains(name)
                 {
-                    record.insert(format!("this.{name}"), value.clone());
+                    record.insert(format!("this.{name}"), Some(value.clone()));
                 }
+            }
+        }
+        // Recording an unset lets a revert or force reproduce it without
+        // having it supplied again.
+        for name in required {
+            if this.get(name).is_some_and(|s| s.value.is_none()) {
+                record.insert(format!("this.{name}"), None);
             }
         }
 
         let mut used = Vec::new();
         let mut usage = self.usage.lock().unwrap_or_else(PoisonError::into_inner);
-        for name in record.keys() {
-            if let Some((key, s)) = lookup(name) {
-                used.push(UsedVar {
-                    name: name.clone(),
-                    value: s.value.clone(),
-                    origin: s.origin,
-                });
-                usage.used.insert(key);
-            }
-        }
-        for name in &r.missing {
+        let unrecorded = r.missing.iter().filter(|n| !record.contains_key(*n));
+        for name in record.keys().chain(unrecorded) {
             // An unset name reads as missing; report where the unset came from.
-            let origin = match lookup(name) {
+            let (value, origin) = match lookup(name) {
                 Some((key, s)) => {
                     usage.used.insert(key);
-                    s.origin
+                    (s.value.clone(), s.origin)
                 }
-                None => Origin::Default,
+                None => (None, Origin::Default),
             };
             used.push(UsedVar {
                 name: name.clone(),
-                value: None,
+                value,
                 origin,
             });
         }
@@ -969,11 +973,11 @@ impl Migrator {
     }
 
     /// The `env` and `this` namespaces for `version`: the supplied values and
-    /// unsets, combined with the values recorded for the version, if any.
+    /// unsets, combined with the values and unsets recorded for the version,
+    /// if any.
     ///
-    /// A recorded `this.*` value describes what was applied and wins. A
-    /// different supplied value, or an unset, is returned as a [`Conflict`];
-    /// the caller
+    /// A recorded `this.*` value or unset describes what was applied and wins.
+    /// A different supplied one is returned as a [`Conflict`]; the caller
     /// raises it only if the render reads that name, so a stale value for a
     /// name the migration doesn't use can't block it. A supplied `env.*` value
     /// describes the environment as it is now and wins, with a notice when it
@@ -982,7 +986,7 @@ impl Migrator {
     fn effective(
         &self,
         version: i64,
-        recorded: Option<&BTreeMap<String, String>>,
+        recorded: Option<&BTreeMap<String, Option<String>>>,
     ) -> (
         BTreeMap<String, Supplied>,
         BTreeMap<String, Supplied>,
@@ -992,10 +996,13 @@ impl Migrator {
         let mut this = self.vars.this(version).cloned().unwrap_or_default();
         let mut conflicts = Vec::new();
         for (namespaced, value) in recorded.into_iter().flatten() {
-            let from_record = || Supplied::new(value.clone(), Origin::Recorded, namespaced.clone());
+            let from_record = || match value {
+                Some(value) => Supplied::new(value.clone(), Origin::Recorded, namespaced.clone()),
+                None => Supplied::unset(Origin::Recorded, namespaced.clone()),
+            };
             if let Some(name) = namespaced.strip_prefix("this.") {
                 if let Some(s) = this.get(name)
-                    && s.value.as_ref() != Some(value)
+                    && s.value != *value
                 {
                     conflicts.push(Conflict {
                         name: namespaced.clone(),
@@ -1005,7 +1012,9 @@ impl Migrator {
                     });
                 }
                 this.insert(name.to_owned(), from_record());
-            } else if let Some(name) = namespaced.strip_prefix("env.") {
+            } else if let Some(name) = namespaced.strip_prefix("env.")
+                && let Some(value) = value
+            {
                 match env.get(name).and_then(|s| s.value.as_ref()) {
                     Some(supplied) if supplied != value => {
                         self.usage
@@ -1048,8 +1057,8 @@ impl Migrator {
 }
 
 /// Prepare the bookkeeping table for a command that writes markers: create the
-/// database and table if missing, and add the `vars` column to a table created
-/// by an older chum.
+/// database and table if missing, and add the `vars` and `unset` columns to a
+/// table created by an older chum.
 async fn ensure_writable(client: &clickhouse::Client, bookkeeping: &Bookkeeping) -> Result<()> {
     backend::ensure_database(client, bookkeeping).await?;
     backend::ensure_table(client, bookkeeping).await?;
@@ -1243,10 +1252,10 @@ mod tests {
         Migration::new(version, "m", Direction::Down, sql).with_template(true)
     }
 
-    fn recorded(items: &[(&str, &str)]) -> BTreeMap<String, String> {
+    fn recorded(items: &[(&str, &str)]) -> BTreeMap<String, Option<String>> {
         items
             .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .map(|(k, v)| ((*k).to_owned(), Some((*v).to_owned())))
             .collect()
     }
 
@@ -1377,14 +1386,13 @@ mod tests {
                 .with_unset(5, "cutoff"),
         );
         let p = migrator.prepare([(migrator.up(5).unwrap(), None)]).unwrap();
-        assert_eq!(
-            p[0].record,
-            recorded(&[
-                ("env.cluster", "c1"),
-                ("env.tier", "prod"),
-                ("this.drop_after", "d")
-            ])
-        );
+        let mut expected = recorded(&[
+            ("env.cluster", "c1"),
+            ("env.tier", "prod"),
+            ("this.drop_after", "d"),
+        ]);
+        expected.insert("this.cutoff".to_owned(), None);
+        assert_eq!(p[0].record, expected);
         let unset = p[0].used.iter().find(|u| u.name == "this.cutoff").unwrap();
         assert_eq!(unset.value, None);
         assert_eq!(unset.origin, Origin::Flag);
@@ -1502,7 +1510,9 @@ mod tests {
             matches!(
                 &err,
                 ChumError::VarConflict { version: 5, name, supplied, recorded, .. }
-                    if name == "this.cutoff" && supplied.as_deref() == Some("U") && recorded == "T"
+                    if name == "this.cutoff"
+                        && supplied.as_deref() == Some("U")
+                        && recorded.as_deref() == Some("T")
             ),
             "{err}"
         );
@@ -1522,6 +1532,46 @@ mod tests {
             "{err}"
         );
         assert!(err.to_string().contains("as unset"), "{err}");
+    }
+
+    #[test]
+    fn a_recorded_unset_wins_like_a_recorded_value() {
+        let migrator = Migrator::new(vec![down(5, "DROP {{ this.x | default('none') }}")]);
+        let mut rec = recorded(&[]);
+        rec.insert("this.x".to_owned(), None);
+        // The recorded unset settles `this.x`, so nothing needs supplying.
+        let p = migrator
+            .prepare([(migrator.down(5).unwrap(), Some(&rec))])
+            .unwrap();
+        assert_eq!(p[0].statements, ["DROP none"]);
+        let used = &p[0].used[0];
+        assert_eq!(
+            (used.value.as_deref(), used.origin),
+            (None, Origin::Recorded)
+        );
+
+        // Unsetting it again is fine.
+        let migrator = migrator.vars(Vars::new().with_unset(5, "x"));
+        assert!(
+            migrator
+                .prepare([(migrator.down(5).unwrap(), Some(&rec))])
+                .is_ok()
+        );
+
+        // A value conflicts with it.
+        let migrator = migrator.vars(Vars::new().with_this(5, "x", "v"));
+        let err = migrator
+            .prepare([(migrator.down(5).unwrap(), Some(&rec))])
+            .err()
+            .expect("conflict");
+        assert!(
+            matches!(&err, ChumError::VarConflict { recorded: None, supplied: Some(v), .. } if v == "v"),
+            "{err}"
+        );
+        assert!(
+            err.to_string().ends_with("but it was applied without it"),
+            "{err}"
+        );
     }
 
     #[test]

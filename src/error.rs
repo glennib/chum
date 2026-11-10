@@ -173,15 +173,15 @@ pub enum ChumError {
     )]
     ClickHouse(#[from] clickhouse::error::Error),
 
-    /// Adding the `vars` column to an existing bookkeeping table failed,
-    /// usually because chum's user lacks `ALTER` on it.
+    /// Adding the `vars` and `unset` columns to an existing bookkeeping table
+    /// failed, usually because chum's user lacks `ALTER` on it.
     #[error("failed to upgrade the bookkeeping table")]
     #[cfg_attr(
         feature = "diagnostic",
         diagnostic(
             code(chum::bookkeeping_upgrade),
             help(
-                "chum adds this column to bookkeeping tables created by older versions. Grant \
+                "chum adds these columns to bookkeeping tables created by older versions. Grant \
                  chum's user ALTER on the bookkeeping table, or have an administrator run: \
                  {statement}"
             )
@@ -257,13 +257,14 @@ pub enum ChumError {
     )]
     Check(Vec<RenderFailure>),
 
-    /// A supplied `this.*` value differs from the one recorded when the
-    /// version was applied. In `revert` and `force` the recorded value
-    /// describes what actually ran, so it wins, and a different supplied
-    /// value is a mistake rather than an override.
+    /// A supplied `this.*` value or unset differs from the one recorded when
+    /// the version was applied. In `revert` and `force` the recorded one
+    /// describes what actually ran, so it wins, and a different supplied one
+    /// is a mistake rather than an override.
     #[error(
-        "{key} supplies {name} {} for version {version}, but it was applied with {recorded:?}",
-        supplied_as(.supplied.as_deref())
+        "{key} supplies {name} {} for version {version}, but it was applied {}",
+        supplied_as(.supplied.as_deref()),
+        applied_as(.recorded.as_deref())
     )]
     #[cfg_attr(
         feature = "diagnostic",
@@ -285,8 +286,9 @@ pub enum ChumError {
         key: String,
         /// The supplied value, or `None` for a name supplied as unset.
         supplied: Option<String>,
-        /// The recorded value.
-        recorded: String,
+        /// The recorded value, or `None` for a name the version was applied
+        /// without.
+        recorded: Option<String>,
     },
 
     /// `reset` was asked to clear a version that isn't dirty.
@@ -483,6 +485,14 @@ impl fmt::Display for RenderFailure {
             write!(f, "{sep} {}", names.join(", "))?;
         }
         Ok(())
+    }
+}
+
+/// `with "value"`, or `without it`.
+fn applied_as(value: Option<&str>) -> String {
+    match value {
+        Some(value) => format!("with {value:?}"),
+        None => "without it".to_owned(),
     }
 }
 

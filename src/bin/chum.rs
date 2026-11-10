@@ -1040,7 +1040,7 @@ async fn run(command: Command, fmt: Resolved) -> miette::Result<()> {
 }
 
 /// Create the bookkeeping database and table if missing and add the `vars`
-/// column to a table an older chum created, logging the upgrade so it shows up
+/// and `unset` columns to a table an older chum created, logging the upgrade so it shows up
 /// in deploy logs. Only commands that write markers call this.
 async fn upgrade_bookkeeping(
     client: &clickhouse::Client,
@@ -1177,7 +1177,7 @@ struct StatusOut {
     state: &'static str,
     applied_at: Option<String>,
     execution_ms: Option<u64>,
-    vars: BTreeMap<String, String>,
+    vars: BTreeMap<String, Option<String>>,
     #[serde(skip_serializing_if = "BTreeSet::is_empty")]
     template_vars: BTreeSet<String>,
 }
@@ -1187,7 +1187,7 @@ struct AppliedOut {
     version: i64,
     description: String,
     execution_ms: u128,
-    vars: BTreeMap<String, String>,
+    vars: BTreeMap<String, Option<String>>,
 }
 
 #[derive(Serialize)]
@@ -1311,8 +1311,11 @@ fn render_info(statuses: &[chum::Status], fmt: Resolved) -> miette::Result<()> {
                     theme::muted().apply_to(took).to_string(),
                 ];
                 if show_vars {
-                    let vars: Vec<String> =
-                        s.vars.iter().map(|(k, v)| format!("{k} = {v}")).collect();
+                    let vars: Vec<String> = s
+                        .vars
+                        .iter()
+                        .map(|(k, v)| format!("{k} = {}", v.as_deref().unwrap_or("(unset)")))
+                        .collect();
                     row.push(vars.join("\n"));
                 }
                 builder.push_record(row);

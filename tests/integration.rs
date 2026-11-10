@@ -385,13 +385,14 @@ async fn question_marks_in_migration_sql_are_sent_verbatim() {
     exec(&admin, &format!("DROP DATABASE IF EXISTS {bookkeeping_db}")).await;
 }
 
-/// A bookkeeping table without the `vars` column, as older chum versions
-/// created it, is read as having empty variables by read-only commands, which
-/// leave it alone, and gains the column on the first writing command. Inserts
-/// that don't name `vars`, as an older chum writes them, keep working.
+/// A bookkeeping table without the `vars` and `unset` columns, as older chum
+/// versions created it, is read as having empty variables by read-only
+/// commands, which leave it alone, and gains the columns on the first writing
+/// command. Inserts that don't name them, as an older chum writes them, keep
+/// working.
 #[tokio::test]
 #[ignore = "requires a running ClickHouse (mise run db:up)"]
-async fn writing_commands_add_the_vars_column_to_an_old_table() {
+async fn writing_commands_add_the_vars_and_unset_columns_to_an_old_table() {
     let admin = client("default");
     let bookkeeping_db = "chum_it_upgrade_bk";
     let app_db = "chum_upgrade_app";
@@ -438,19 +439,19 @@ async fn writing_commands_add_the_vars_column_to_an_old_table() {
     );
 
     migrator.run(&db, &bookkeeping, None).await.expect("run");
-    assert!(
-        chum::backend::has_vars_column(&db, &bookkeeping)
-            .await
-            .expect("column lookup"),
-        "run added the column"
-    );
+    for has_column in [
+        chum::backend::has_vars_column(&db, &bookkeeping).await,
+        chum::backend::has_unset_column(&db, &bookkeeping).await,
+    ] {
+        assert!(has_column.expect("column lookup"), "run added the column");
+    }
     let recorded = chum::backend::list_applied(&db, &bookkeeping)
         .await
         .expect("list_applied");
     assert!(recorded[0].success);
     assert!(recorded[0].vars.is_empty());
 
-    // An older chum's insert names its columns and omits `vars`.
+    // An older chum's insert names its columns and omits `vars` and `unset`.
     exec(
         &admin,
         &format!(
@@ -559,10 +560,10 @@ async fn templates_record_their_variables_and_revert_from_them() {
         "events, prod_only, cutoffs"
     );
 
-    let expected = |items: &[(&str, &str)]| -> BTreeMap<String, String> {
+    let expected = |items: &[(&str, &str)]| -> BTreeMap<String, Option<String>> {
         items
             .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .map(|(k, v)| ((*k).to_owned(), Some((*v).to_owned())))
             .collect()
     };
     let statuses = migrator.info(&db, &bookkeeping).await.expect("info");
@@ -619,6 +620,105 @@ async fn templates_record_their_variables_and_revert_from_them() {
         .expect("read log");
     assert_eq!(logged, [cutoff], "the down rendered the recorded cutoff");
     assert_eq!(bookkeeping_rows(&admin, bookkeeping_db).await, 0);
+
+    template_teardown(&admin, &[app_db, bookkeeping_db, log_db]).await;
+}
+
+/// An apply records the `this.*` names it was unset for, so a revert renders
+/// without them and needs nothing supplied, and a value supplied for one is a
+/// conflict.
+#[cfg(feature = "template")]
+#[tokio::test]
+#[ignore = "requires a running ClickHouse (mise run db:up)"]
+async fn unset_names_are_recorded_and_reverted_with() {
+    use chum::Direction;
+    use chum::Migration;
+
+    let admin = client("default");
+    let (bookkeeping_db, app_db, log_db) = (
+        "chum_it_tpl_unset_bk",
+        "chum_it_tpl_unset_app",
+        "chum_it_tpl_unset_log",
+    );
+    template_setup(&admin, bookkeeping_db, app_db, log_db).await;
+    let db = unpinned_client();
+    let bookkeeping = Bookkeeping::new(bookkeeping_db, TABLE).expect("valid bookkeeping");
+    let migrator = |vars: chum::Vars| {
+        let template =
+            |direction, sql: String| Migration::new(1, "unset", direction, sql).with_template(true);
+        Migrator::new(vec![
+            template(
+                Direction::Up,
+                format!(
+                    "CREATE DATABASE {app_db};
+                     CREATE TABLE {app_db}.t (c String) ENGINE = MergeTree ORDER BY c;
+                     INSERT INTO {app_db}.t VALUES ({{{{ this.cutoff | default('none') | sql_string }}}});"
+                ),
+            ),
+            template(
+                Direction::Down,
+                format!(
+                    "{{% if this.keep is defined %}}SELECT 1;{{% else %}}DROP DATABASE {app_db};{{% endif %}}"
+                ),
+            ),
+        ])
+        .vars(vars)
+    };
+
+    // The up needs a decision for the name only its down reads.
+    let err = migrator(chum::Vars::new().with_unset(1, "cutoff"))
+        .run(&db, &bookkeeping, None)
+        .await
+        .expect_err("this.keep is unsettled");
+    assert!(err.to_string().contains("`this.keep`"), "{err}");
+
+    let unset = chum::Vars::new()
+        .with_unset(1, "cutoff")
+        .with_unset(1, "keep");
+    let applied = migrator(unset)
+        .run(&db, &bookkeeping, None)
+        .await
+        .expect("run");
+    let both_unset: std::collections::BTreeMap<String, Option<String>> = [
+        ("this.cutoff".to_owned(), None),
+        ("this.keep".to_owned(), None),
+    ]
+    .into();
+    assert_eq!(applied[0].vars, both_unset);
+    let cutoff: String = admin
+        .query(&format!("SELECT c FROM {app_db}.t"))
+        .fetch_one()
+        .await
+        .expect("read cutoff");
+    assert_eq!(cutoff, "none");
+
+    let bare = migrator(chum::Vars::new());
+    let statuses = bare.info(&db, &bookkeeping).await.expect("info");
+    assert_eq!(statuses[0].vars, both_unset);
+    let recorded: Vec<String> = admin
+        .query(&format!(
+            "SELECT arrayJoin(argMax(unset, seq)) FROM {bookkeeping_db}.{TABLE} GROUP BY version"
+        ))
+        .fetch_all()
+        .await
+        .expect("unset column");
+    assert_eq!(recorded, ["this.cutoff", "this.keep"]);
+
+    let err = migrator(chum::Vars::new().with_this(1, "keep", "yes"))
+        .revert_plan(&db, &bookkeeping, i64::MIN)
+        .await
+        .expect_err("conflict with the recorded unset");
+    assert!(
+        matches!(&err, chum::ChumError::VarConflict { recorded: None, .. }),
+        "{err}"
+    );
+
+    let reverted = bare.undo(&db, &bookkeeping, i64::MIN).await.expect("undo");
+    assert_eq!(reverted, [1]);
+    assert!(
+        !database_exists(&admin, app_db).await,
+        "the down took the recorded no-keep branch"
+    );
 
     template_teardown(&admin, &[app_db, bookkeeping_db, log_db]).await;
 }
@@ -703,7 +803,7 @@ async fn a_failed_guard_is_cleared_with_reset() {
     let statuses = migrator.info(&db, &bookkeeping).await.expect("info");
     assert_eq!(statuses[0].state, State::Applied);
     assert_eq!(statuses[1].state, State::Dirty);
-    assert_eq!(statuses[1].vars["this.cutoff"], "bad");
+    assert_eq!(statuses[1].vars["this.cutoff"].as_deref(), Some("bad"));
 
     let err = template_migrator(base.clone().with_this(2, "cutoff", "good"))
         .force(&db, &bookkeeping, 2)
@@ -728,7 +828,7 @@ async fn a_failed_guard_is_cleared_with_reset() {
     let fixed = template_migrator(base.with_this(2, "cutoff", "good"));
     let applied = fixed.run(&db, &bookkeeping, None).await.expect("run");
     assert_eq!(applied.len(), 1);
-    assert_eq!(applied[0].vars["this.cutoff"], "good");
+    assert_eq!(applied[0].vars["this.cutoff"].as_deref(), Some("good"));
 
     template_teardown(&admin, &[app_db, bookkeeping_db, log_db]).await;
 }

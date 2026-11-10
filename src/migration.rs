@@ -155,9 +155,10 @@ pub struct AppliedMigration {
     /// is `true`.
     pub reverting: bool,
     /// The variables the latest marker recorded, keyed by namespaced name
-    /// (`env.tier`, `this.cutoff`). Empty for plain migrations and for rows
-    /// written before chum recorded variables.
-    pub vars: BTreeMap<String, String>,
+    /// (`env.tier`, `this.cutoff`), with `None` for a `this.*` name the
+    /// version was applied without (unset). Empty for plain migrations and for
+    /// rows written before chum recorded variables.
+    pub vars: BTreeMap<String, Option<String>>,
 }
 
 /// Compute the hex-encoded SHA-384 checksum of a migration's SQL.
