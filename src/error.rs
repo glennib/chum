@@ -559,7 +559,9 @@ fn render_help(failures: &[RenderFailure]) -> String {
             "Every `this.*` name a version's templates refer to must be supplied or unset, so a \
              forgotten or misspelt key can't silently skip a branch: pass `--var \
              <version>_<name>=<value>`, or `--unset <version>_<name>` to run it without that \
-             value (`CHUM_VAR_<key>=<value>` and `CHUM_UNSET_<key>=` in the environment).",
+             value (`CHUM_VAR_<key>=<value>` and `CHUM_UNSET_<key>=` in the environment). Where \
+             every migration runs from scratch without per-apply values (a laptop, CI), \
+             `--missing-this unset` unsets every such name.",
         );
     }
     if has(RenderFailureKind::InvalidValue) {

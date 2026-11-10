@@ -31,6 +31,7 @@ use crate::migration::AppliedMigration;
 use crate::migration::Direction;
 use crate::migration::Migration;
 use crate::split::split_statements;
+use crate::vars::MissingThis;
 use crate::vars::Origin;
 use crate::vars::References;
 use crate::vars::Supplied;
@@ -235,6 +236,7 @@ pub struct Migrator {
     migrations: Cow<'static, [Migration]>,
     ignore_missing: bool,
     vars: Vars,
+    missing_this: MissingThis,
     usage: Mutex<Usage>,
 }
 
@@ -246,6 +248,7 @@ impl Migrator {
             migrations: migrations.into(),
             ignore_missing: false,
             vars: Vars::new(),
+            missing_this: MissingThis::default(),
             usage: Mutex::new(Usage::default()),
         }
     }
@@ -262,6 +265,15 @@ impl Migrator {
     #[must_use]
     pub fn vars(mut self, vars: Vars) -> Self {
         self.vars = vars;
+        self
+    }
+
+    /// What to do with a `this.*` name a version's templates refer to that is
+    /// neither supplied, unset nor recorded: fail
+    /// ([`MissingThis::Error`], the default), or treat it as unset.
+    #[must_use]
+    pub fn missing_this(mut self, missing_this: MissingThis) -> Self {
+        self.missing_this = missing_this;
         self
     }
 
@@ -806,8 +818,18 @@ impl Migrator {
                     migration.file_name.to_string(),
                 ));
             }
-            let (env, this, conflicts) = self.effective(migration.version, recorded);
+            let (env, mut this, conflicts) = self.effective(migration.version, recorded);
             let required = self.required_this(migration);
+            if self.missing_this == MissingThis::Unset {
+                for name in &required {
+                    this.entry(name.clone()).or_insert_with(|| {
+                        Supplied::unset(
+                            Origin::MissingThis,
+                            format!("{}_{name}", migration.version),
+                        )
+                    });
+                }
+            }
             let unsupplied: Vec<String> = required
                 .iter()
                 .filter(|name| !this.contains_key(*name))
@@ -1459,6 +1481,32 @@ mod tests {
         );
         let migrator = migrator.vars(Vars::new().with_this(1, "drop", "yes"));
         assert_eq!(migrator.render(1, Direction::Down).unwrap(), ["yes"]);
+    }
+
+    #[test]
+    fn missing_this_unset_fills_and_records_every_unsettled_name() {
+        let migrator = Migrator::new(vec![
+            up(1, "{{ this.a | default('x') }}{{ this.b | default('y') }}"),
+            down(1, "{{ this.c | default('z') }}"),
+        ])
+        .vars(Vars::new().with_this(1, "a", "A"))
+        .missing_this(MissingThis::Unset);
+        let p = migrator.prepare([(migrator.up(1).unwrap(), None)]).unwrap();
+        assert_eq!(p[0].statements, ["Ay"]);
+        let mut expected = recorded(&[("this.a", "A")]);
+        expected.insert("this.b".to_owned(), None);
+        expected.insert("this.c".to_owned(), None);
+        assert_eq!(p[0].record, expected);
+        let b = p[0].used.iter().find(|u| u.name == "this.b").unwrap();
+        assert_eq!(b.origin, Origin::MissingThis);
+        assert_eq!(b.origin.label(true), "--missing-this");
+
+        // A recorded value still wins over it.
+        let rec = recorded(&[("this.c", "C")]);
+        let p = migrator
+            .prepare([(migrator.down(1).unwrap(), Some(&rec))])
+            .unwrap();
+        assert_eq!(p[0].statements, ["C"]);
     }
 
     #[test]

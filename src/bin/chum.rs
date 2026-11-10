@@ -380,15 +380,23 @@ impl SourceArgs {
     }
 
     /// A migrator whose templates render with `--var`, `--unset`,
-    /// `CHUM_VAR_*` and `CHUM_UNSET_*`.
+    /// `CHUM_VAR_*` and `CHUM_UNSET_*`, and `--missing-this`.
     fn migrator_with(&self, var: &VarArgs) -> miette::Result<Migrator> {
-        let VarArgs { vars, unset } = var;
+        let VarArgs {
+            vars,
+            unset,
+            missing_this,
+        } = var;
         let flags = vars
             .iter()
             .map(|(key, value)| (key.clone(), Some(value.clone())))
             .chain(unset.iter().map(|key| (key.clone(), None)));
         let vars = Vars::from_keys(flags, env_vars(std::env::vars_os())?)?;
-        Ok(self.migrator()?.vars(vars))
+        let missing_this = match missing_this {
+            MissingThisArg::Error => chum::MissingThis::Error,
+            MissingThisArg::Unset => chum::MissingThis::Unset,
+        };
+        Ok(self.migrator()?.vars(vars).missing_this(missing_this))
     }
 }
 
@@ -523,6 +531,29 @@ struct VarArgs {
     /// key, and one source may not both set and unset a key.
     #[arg(long, value_name = "KEY")]
     unset: Vec<String>,
+
+    /// What to do with a `this.*` name a version's templates refer to that is
+    /// neither supplied (`--var`), unset (`--unset`) nor recorded.
+    ///
+    /// `error` fails before anything runs. `unset` treats every such name as
+    /// unset, and records it so: for databases built from scratch, such as a
+    /// laptop or CI, which run every migration without per-apply values. Where
+    /// per-apply values matter (staging, production), leave it at `error`: there
+    /// `unset` turns a forgotten key back into a silently skipped branch.
+    #[arg(
+        long,
+        env = "CHUM_MISSING_THIS",
+        value_enum,
+        default_value_t = MissingThisArg::Error
+    )]
+    missing_this: MissingThisArg,
+}
+
+/// `--missing-this`; maps to [`chum::MissingThis`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum MissingThisArg {
+    Error,
+    Unset,
 }
 
 /// `--yes`, for the subcommands that ask before changing bookkeeping.
@@ -2200,7 +2231,7 @@ mod tests {
             "table",
             "bookkeeping-database",
         ];
-        const VAR: &[&str] = &["var", "unset"];
+        const VAR: &[&str] = &["var", "unset", "missing-this"];
         let expected: &[(&str, &[&[&str]])] = &[
             ("run", &[&["target", "dry-run"], VAR, SOURCE, DB]),
             (
@@ -2498,7 +2529,16 @@ mod tests {
             panic!("expected revert");
         };
         assert_eq!(var.unset, ["5_cutoff", "6_x"]);
+        assert_eq!(var.missing_this, MissingThisArg::Error);
         assert!(Cli::try_parse_from(["chum", "info", "--unset", "5_x"]).is_err());
+
+        let cli = Cli::try_parse_from(["chum", "run", "--missing-this", "unset"])
+            .expect("valid args parse");
+        let Command::Run { var, .. } = cli.command else {
+            panic!("expected run");
+        };
+        assert_eq!(var.missing_this, MissingThisArg::Unset);
+        assert!(Cli::try_parse_from(["chum", "run", "--missing-this", "skip"]).is_err());
     }
 
     #[test]

@@ -97,6 +97,7 @@ pub use migrator::State;
 pub use migrator::Status;
 pub use migrator::UsedVar;
 pub use migrator::VarNotice;
+pub use vars::MissingThis;
 pub use vars::Origin;
 pub use vars::Supplied;
 pub use vars::VarKey;

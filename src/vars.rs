@@ -39,6 +39,8 @@ pub enum Origin {
     Recorded,
     /// Not supplied; the template's `| default(…)` or `is defined` covered it.
     Default,
+    /// Not supplied, and unset by [`MissingThis::Unset`].
+    MissingThis,
 }
 
 impl Origin {
@@ -51,6 +53,7 @@ impl Origin {
             Origin::Environment => "environment",
             Origin::Recorded => "recorded",
             Origin::Default => "default",
+            Origin::MissingThis => "--missing-this",
         }
     }
 
@@ -61,7 +64,7 @@ impl Origin {
         match self {
             Origin::Flag => format!("--var {key}"),
             Origin::Environment => format!("CHUM_VAR_{key}"),
-            Origin::Recorded | Origin::Default => key.to_owned(),
+            Origin::Recorded | Origin::Default | Origin::MissingThis => key.to_owned(),
         }
     }
 
@@ -72,7 +75,7 @@ impl Origin {
         match self {
             Origin::Flag => format!("--unset {key}"),
             Origin::Environment => format!("CHUM_UNSET_{key}"),
-            Origin::Recorded | Origin::Default => key.to_owned(),
+            Origin::Recorded | Origin::Default | Origin::MissingThis => key.to_owned(),
         }
     }
 
@@ -91,6 +94,19 @@ impl fmt::Display for Origin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// What to do with a `this.*` name a version's templates refer to that is
+/// neither supplied, unset nor recorded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MissingThis {
+    /// Fail before anything runs, naming every such name.
+    #[default]
+    Error,
+    /// Treat it as unset, and record it so. For databases built from scratch
+    /// (a laptop, CI), which run every migration without per-apply values.
+    Unset,
 }
 
 /// A variable, identified by its namespace and name.
