@@ -159,6 +159,12 @@ pub struct AppliedMigration {
     /// version was applied without (unset). Empty for plain migrations and for
     /// rows written before chum recorded variables.
     pub vars: BTreeMap<String, Option<String>>,
+    /// Whether [`vars`](Self::vars) lists every `this.*` name the version was
+    /// applied without. `false` for rows written by chum 0.5 and earlier,
+    /// which recorded only values: there, a `this.*` name the version's
+    /// templates refer to but `vars` lacks was not supplied, and revert and
+    /// force read it as unset.
+    pub records_unsets: bool,
 }
 
 /// Compute the hex-encoded SHA-384 checksum of a migration's SQL.

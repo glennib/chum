@@ -43,8 +43,8 @@ static BOOTSTRAP_MIGRATIONS_OVERRIDE: Dir =
 static QUESTION_MARK_MIGRATIONS: Dir =
     include_dir!("$CARGO_MANIFEST_DIR/tests/question_mark_migrations");
 
-/// A self-bootstrapping migration used against a bookkeeping table created
-/// with the schema chum used before it recorded variables.
+/// A self-bootstrapping migration used against bookkeeping tables created
+/// with the schemas older chum releases used.
 static UPGRADE_MIGRATIONS: Dir = include_dir!("$CARGO_MANIFEST_DIR/tests/upgrade_migrations");
 
 const TEST_DB: &str = "chum_integration_test";
@@ -385,25 +385,21 @@ async fn question_marks_in_migration_sql_are_sent_verbatim() {
     exec(&admin, &format!("DROP DATABASE IF EXISTS {bookkeeping_db}")).await;
 }
 
-/// A bookkeeping table without the `vars` and `unset` columns, as older chum
-/// versions created it, is read as having empty variables by read-only
-/// commands, which leave it alone, and gains the columns on the first writing
-/// command. Inserts that don't name them, as an older chum writes them, keep
-/// working.
-#[tokio::test]
-#[ignore = "requires a running ClickHouse (mise run db:up)"]
-async fn writing_commands_add_the_vars_and_unset_columns_to_an_old_table() {
-    let admin = client("default");
-    let bookkeeping_db = "chum_it_upgrade_bk";
-    let app_db = "chum_upgrade_app";
+/// The columns each older chum release created the bookkeeping table with,
+/// after the base schema of 0.1.0 – 0.2.5.
+const OLD_TABLES: [(&str, &str); 2] = [
+    ("0.1.0 – 0.2.5", ""),
+    ("0.3.0 – 0.5.0", ", vars Map(String, String)"),
+];
 
-    exec(&admin, &format!("DROP DATABASE IF EXISTS {app_db}")).await;
-    exec(&admin, &format!("DROP DATABASE IF EXISTS {bookkeeping_db}")).await;
-    exec(&admin, &format!("CREATE DATABASE {bookkeeping_db}")).await;
+/// Create `<database>.<TABLE>` as an older chum did, with `added` columns
+/// after the base schema.
+async fn create_old_table(admin: &clickhouse::Client, database: &str, added: &str) {
+    exec(admin, &format!("CREATE DATABASE {database}")).await;
     exec(
-        &admin,
+        admin,
         &format!(
-            "CREATE TABLE {bookkeeping_db}.{TABLE}
+            "CREATE TABLE {database}.{TABLE}
              (
                  version      Int64,
                  description  String,
@@ -412,67 +408,169 @@ async fn writing_commands_add_the_vars_and_unset_columns_to_an_old_table() {
                  success      Bool,
                  applied_at   DateTime64(3, 'UTC') DEFAULT now64(3),
                  seq          UInt64
+                 {added}
              )
              ENGINE = MergeTree
              ORDER BY (version, seq)"
         ),
     )
     .await;
+}
 
+/// The bookkeeping table's column names, in table order.
+async fn columns(admin: &clickhouse::Client, database: &str) -> Vec<String> {
+    admin
+        .query("SELECT name FROM system.columns WHERE database = ? AND table = ? ORDER BY position")
+        .bind(database)
+        .bind(TABLE)
+        .fetch_all()
+        .await
+        .expect("columns")
+}
+
+/// A bookkeeping table as any older chum release created it is read by
+/// read-only commands, which leave it alone, and gains the missing columns on
+/// the first writing command, ending with the same columns as a table this
+/// chum creates. Inserts that name only the base columns, as an older chum
+/// writes them, keep working and read as not recording unsets.
+#[tokio::test]
+#[ignore = "requires a running ClickHouse (mise run db:up)"]
+async fn writing_commands_upgrade_a_table_from_any_older_chum() {
+    let admin = client("default");
+    let fresh_db = "chum_it_upgrade_fresh_bk";
+    let bookkeeping_db = "chum_it_upgrade_bk";
+    let app_db = "chum_upgrade_app";
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {fresh_db}")).await;
     let db = unpinned_client();
+    let fresh = Bookkeeping::new(fresh_db, TABLE).expect("valid bookkeeping");
+    chum::backend::ensure_database(&db, &fresh)
+        .await
+        .expect("ensure database");
+    chum::backend::ensure_table(&db, &fresh)
+        .await
+        .expect("ensure table");
+    let current = columns(&admin, fresh_db).await;
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {fresh_db}")).await;
+
     let bookkeeping = Bookkeeping::new(bookkeeping_db, TABLE).expect("valid bookkeeping");
     let migrator =
         Migrator::new(source::from_dir(&UPGRADE_MIGRATIONS).expect("embedded migrations"));
+    for (release, added) in OLD_TABLES {
+        exec(&admin, &format!("DROP DATABASE IF EXISTS {app_db}")).await;
+        exec(&admin, &format!("DROP DATABASE IF EXISTS {bookkeeping_db}")).await;
+        create_old_table(&admin, bookkeeping_db, added).await;
+        let old = columns(&admin, bookkeeping_db).await;
 
-    let statuses = migrator.info(&db, &bookkeeping).await.expect("info");
-    assert_eq!(statuses[0].state, State::Pending);
-    assert!(statuses[0].vars.is_empty());
-    migrator
-        .plan(&db, &bookkeeping, None)
-        .await
-        .expect("dry run");
-    assert!(
-        !chum::backend::has_vars_column(&db, &bookkeeping)
+        let statuses = migrator.info(&db, &bookkeeping).await.expect("info");
+        assert_eq!(statuses[0].state, State::Pending, "{release}");
+        assert!(statuses[0].vars.is_empty(), "{release}");
+        migrator
+            .plan(&db, &bookkeeping, None)
             .await
-            .expect("column lookup"),
-        "read-only commands leave the table alone"
-    );
+            .expect("dry run");
+        assert_eq!(
+            columns(&admin, bookkeeping_db).await,
+            old,
+            "{release}: read-only commands leave the table alone"
+        );
 
-    migrator.run(&db, &bookkeeping, None).await.expect("run");
-    for has_column in [
-        chum::backend::has_vars_column(&db, &bookkeeping).await,
-        chum::backend::has_unset_column(&db, &bookkeeping).await,
-    ] {
-        assert!(has_column.expect("column lookup"), "run added the column");
+        migrator.run(&db, &bookkeeping, None).await.expect("run");
+        assert_eq!(
+            columns(&admin, bookkeeping_db).await,
+            current,
+            "{release}: run brought the table up to date"
+        );
+        let recorded = chum::backend::list_applied(&db, &bookkeeping)
+            .await
+            .expect("list_applied");
+        assert!(recorded[0].success, "{release}");
+        assert!(recorded[0].vars.is_empty(), "{release}");
+        assert!(recorded[0].records_unsets, "{release}");
+
+        // An older chum's insert names its columns and omits the added ones.
+        exec(
+            &admin,
+            &format!(
+                "INSERT INTO {bookkeeping_db}.{TABLE}
+                     (version, description, checksum, execution_ms, success, seq)
+                 SELECT 1, 'upgrade', '{}', 0, true, toUnixTimestamp64Nano(now64(9))",
+                recorded[0].checksum
+            ),
+        )
+        .await;
+        let recorded = chum::backend::list_applied(&db, &bookkeeping)
+            .await
+            .expect("list_applied after an old-style insert");
+        assert!(recorded[0].success, "{release}");
+        assert!(recorded[0].vars.is_empty(), "{release}");
+        assert!(!recorded[0].records_unsets, "{release}");
+
+        migrator
+            .undo(&db, &bookkeeping, i64::MIN)
+            .await
+            .expect("undo");
     }
-    let recorded = chum::backend::list_applied(&db, &bookkeeping)
-        .await
-        .expect("list_applied");
-    assert!(recorded[0].success);
-    assert!(recorded[0].vars.is_empty());
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {app_db}")).await;
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {bookkeeping_db}")).await;
+}
 
-    // An older chum's insert names its columns and omits `vars` and `unset`.
+/// chum 0.5 recorded only the values a version used, so a version it applied
+/// without an optional `this.*` value has no record of that name. After the
+/// upgrade, revert reads the name as unset and needs nothing supplied, as
+/// 0.5 did.
+#[cfg(feature = "template")]
+#[tokio::test]
+#[ignore = "requires a running ClickHouse (mise run db:up)"]
+async fn a_version_an_older_chum_applied_reverts_with_unrecorded_names_unset() {
+    use chum::Direction;
+    use chum::Migration;
+
+    let admin = client("default");
+    let (bookkeeping_db, app_db) = ("chum_it_tpl_older_bk", "chum_it_tpl_older_app");
+    for db in [app_db, bookkeeping_db] {
+        exec(&admin, &format!("DROP DATABASE IF EXISTS {db}")).await;
+    }
+    let (_, vars_column) = OLD_TABLES[1];
+    create_old_table(&admin, bookkeeping_db, vars_column).await;
+
+    let template =
+        |direction, sql: String| Migration::new(1, "older", direction, sql).with_template(true);
+    let migrator = Migrator::new(vec![
+        template(Direction::Up, format!("CREATE DATABASE {app_db}")),
+        template(
+            Direction::Down,
+            format!(
+                "{{% if this.keep is defined %}}SELECT 1;{{% else %}}DROP DATABASE {app_db};{{% endif %}}"
+            ),
+        ),
+    ]);
+    let checksum = &migrator.migrations()[0].checksum;
+
+    // What chum 0.5 left behind after applying version 1 without `this.keep`.
+    exec(&admin, &format!("CREATE DATABASE {app_db}")).await;
     exec(
         &admin,
         &format!(
             "INSERT INTO {bookkeeping_db}.{TABLE}
-                 (version, description, checksum, execution_ms, success, seq)
-             SELECT 1, 'upgrade', '{}', 0, true, toUnixTimestamp64Nano(now64(9))",
-            recorded[0].checksum
+                 (version, description, checksum, execution_ms, success, seq, vars)
+             SELECT 1, 'older', '{checksum}', 0, true, toUnixTimestamp64Nano(now64(9)), map()"
         ),
     )
     .await;
-    let recorded = chum::backend::list_applied(&db, &bookkeeping)
-        .await
-        .expect("list_applied after an old-style insert");
-    assert!(recorded[0].success);
-    assert!(recorded[0].vars.is_empty());
 
-    migrator
+    let db = unpinned_client();
+    let bookkeeping = Bookkeeping::new(bookkeeping_db, TABLE).expect("valid bookkeeping");
+    let reverted = migrator
         .undo(&db, &bookkeeping, i64::MIN)
         .await
-        .expect("undo");
-    exec(&admin, &format!("DROP DATABASE IF EXISTS {app_db}")).await;
+        .expect("undo with nothing supplied");
+    assert_eq!(reverted, [1]);
+    assert!(
+        !database_exists(&admin, app_db).await,
+        "the down read `this.keep` as unset"
+    );
+
     exec(&admin, &format!("DROP DATABASE IF EXISTS {bookkeeping_db}")).await;
 }
 

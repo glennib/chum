@@ -1070,9 +1070,9 @@ async fn run(command: Command, fmt: Resolved) -> miette::Result<()> {
     Ok(())
 }
 
-/// Create the bookkeeping database and table if missing and add the `vars`
-/// and `unset` columns to a table an older chum created, logging the upgrade so it shows up
-/// in deploy logs. Only commands that write markers call this.
+/// Create the bookkeeping database and table if missing and add the columns a
+/// table an older chum created lacks, logging the upgrade so it shows up in
+/// deploy logs. Only commands that write markers call this.
 async fn upgrade_bookkeeping(
     client: &clickhouse::Client,
     bookkeeping: &chum::Bookkeeping,

@@ -8,7 +8,9 @@
 //! template, including those the supplied values don't take.
 //!
 //! Every `this.*` name a version's templates refer to must be supplied, unset
-//! or recorded before the version renders; see [`crate::vars`].
+//! or recorded before the version renders; see [`crate::vars`]. A record an
+//! older chum wrote lists only values, so a name it lacks reads as unset (see
+//! [`AppliedMigration::records_unsets`]).
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -567,7 +569,7 @@ impl Migrator {
                     rec.version
                 ))
             })?;
-            downs.push((down, Some(&rec.vars)));
+            downs.push((down, Some(Recorded::from(*rec))));
         }
         Ok(versions.into_iter().zip(self.prepare(downs)?).collect())
     }
@@ -595,9 +597,8 @@ impl Migrator {
         let recorded = backend::list_applied(client, bookkeeping)
             .await?
             .into_iter()
-            .find(|m| m.version == version)
-            .map(|m| m.vars);
-        let prepared = self.prepare([(migration, recorded.as_ref())])?;
+            .find(|m| m.version == version);
+        let prepared = self.prepare([(migration, recorded.as_ref().map(Recorded::from))])?;
         backend::record(client, bookkeeping, migration, 0, true, &prepared[0].record).await?;
         Ok(())
     }
@@ -805,7 +806,7 @@ impl Migrator {
     /// once everything rendered.
     fn prepare<'a, I>(&'a self, migrations: I) -> Result<Vec<Prepared<'a>>>
     where
-        I: IntoIterator<Item = (&'a Migration, Option<&'a BTreeMap<String, Option<String>>>)>,
+        I: IntoIterator<Item = (&'a Migration, Option<Recorded<'a>>)>,
     {
         let migrations: Vec<_> = migrations.into_iter().collect();
         check_all(migrations.iter().map(|(m, _)| *m))?;
@@ -818,8 +819,18 @@ impl Migrator {
                     migration.file_name.to_string(),
                 ));
             }
-            let (env, mut this, conflicts) = self.effective(migration.version, recorded);
+            let (env, mut this, conflicts) =
+                self.effective(migration.version, recorded.map(|r| r.vars));
             let required = self.required_this(migration);
+            if let Some(r) = recorded
+                && !r.records_unsets
+            {
+                for name in &required {
+                    this.entry(name.clone()).or_insert_with(|| {
+                        Supplied::unset(Origin::Recorded, format!("this.{name}"))
+                    });
+                }
+            }
             if self.missing_this == MissingThis::Unset {
                 for name in &required {
                     this.entry(name.clone()).or_insert_with(|| {
@@ -1079,13 +1090,31 @@ impl Migrator {
 }
 
 /// Prepare the bookkeeping table for a command that writes markers: create the
-/// database and table if missing, and add the `vars` and `unset` columns to a
-/// table created by an older chum.
+/// database and table if missing, and add the columns a table created by an
+/// older chum lacks.
 async fn ensure_writable(client: &clickhouse::Client, bookkeeping: &Bookkeeping) -> Result<()> {
     backend::ensure_database(client, bookkeeping).await?;
     backend::ensure_table(client, bookkeeping).await?;
     backend::upgrade_table(client, bookkeeping).await?;
     Ok(())
+}
+
+/// What the bookkeeping recorded for a version, as [`Migrator::prepare`]
+/// reads it.
+#[derive(Debug, Clone, Copy)]
+struct Recorded<'a> {
+    vars: &'a BTreeMap<String, Option<String>>,
+    /// See [`AppliedMigration::records_unsets`].
+    records_unsets: bool,
+}
+
+impl<'a> From<&'a AppliedMigration> for Recorded<'a> {
+    fn from(applied: &'a AppliedMigration) -> Self {
+        Self {
+            vars: &applied.vars,
+            records_unsets: applied.records_unsets,
+        }
+    }
 }
 
 /// Run a prepared migration's statements in order, stopping at the first
@@ -1272,6 +1301,14 @@ mod tests {
 
     fn down(version: i64, sql: &'static str) -> Migration {
         Migration::new(version, "m", Direction::Down, sql).with_template(true)
+    }
+
+    /// A record this chum wrote, which lists unsets.
+    fn current(vars: &BTreeMap<String, Option<String>>) -> Recorded<'_> {
+        Recorded {
+            vars,
+            records_unsets: true,
+        }
     }
 
     fn recorded(items: &[(&str, &str)]) -> BTreeMap<String, Option<String>> {
@@ -1504,7 +1541,7 @@ mod tests {
         // A recorded value still wins over it.
         let rec = recorded(&[("this.c", "C")]);
         let p = migrator
-            .prepare([(migrator.down(1).unwrap(), Some(&rec))])
+            .prepare([(migrator.down(1).unwrap(), Some(current(&rec)))])
             .unwrap();
         assert_eq!(p[0].statements, ["C"]);
     }
@@ -1527,7 +1564,7 @@ mod tests {
             .vars(Vars::new().with_this(5, "other", "supplied"));
         let rec = recorded(&[("this.cutoff", "T")]);
         let p = migrator
-            .prepare([(migrator.down(5).unwrap(), Some(&rec))])
+            .prepare([(migrator.down(5).unwrap(), Some(current(&rec)))])
             .unwrap();
         // The recorded value fills `cutoff`; the supplied one fills a gap.
         assert_eq!(p[0].statements, ["T/supplied"]);
@@ -1540,7 +1577,7 @@ mod tests {
         );
         assert!(
             migrator
-                .prepare([(migrator.down(5).unwrap(), Some(&rec))])
+                .prepare([(migrator.down(5).unwrap(), Some(current(&rec)))])
                 .is_ok()
         );
 
@@ -1551,7 +1588,7 @@ mod tests {
                 .with_this(5, "other", "o"),
         );
         let err = migrator
-            .prepare([(migrator.down(5).unwrap(), Some(&rec))])
+            .prepare([(migrator.down(5).unwrap(), Some(current(&rec)))])
             .err()
             .expect("conflict");
         assert!(
@@ -1572,7 +1609,7 @@ mod tests {
                 .with_this(5, "other", "o"),
         );
         let err = migrator
-            .prepare([(migrator.down(5).unwrap(), Some(&rec))])
+            .prepare([(migrator.down(5).unwrap(), Some(current(&rec)))])
             .err()
             .expect("conflict");
         assert!(
@@ -1589,7 +1626,7 @@ mod tests {
         rec.insert("this.x".to_owned(), None);
         // The recorded unset settles `this.x`, so nothing needs supplying.
         let p = migrator
-            .prepare([(migrator.down(5).unwrap(), Some(&rec))])
+            .prepare([(migrator.down(5).unwrap(), Some(current(&rec)))])
             .unwrap();
         assert_eq!(p[0].statements, ["DROP none"]);
         let used = &p[0].used[0];
@@ -1602,14 +1639,14 @@ mod tests {
         let migrator = migrator.vars(Vars::new().with_unset(5, "x"));
         assert!(
             migrator
-                .prepare([(migrator.down(5).unwrap(), Some(&rec))])
+                .prepare([(migrator.down(5).unwrap(), Some(current(&rec)))])
                 .is_ok()
         );
 
         // A value conflicts with it.
         let migrator = migrator.vars(Vars::new().with_this(5, "x", "v"));
         let err = migrator
-            .prepare([(migrator.down(5).unwrap(), Some(&rec))])
+            .prepare([(migrator.down(5).unwrap(), Some(current(&rec)))])
             .err()
             .expect("conflict");
         assert!(
@@ -1623,6 +1660,47 @@ mod tests {
     }
 
     #[test]
+    fn a_name_an_older_chum_did_not_record_reads_as_unset() {
+        let migrator = Migrator::new(vec![down(
+            5,
+            "DROP {{ this.x | default('none') }}/{{ this.y }}",
+        )]);
+        let rec = recorded(&[("this.y", "Y")]);
+
+        // This chum records every unset, so a name its record lacks must be
+        // supplied.
+        let err = migrator
+            .prepare([(migrator.down(5).unwrap(), Some(current(&rec)))])
+            .err()
+            .expect("unsupplied");
+        let ChumError::Render(failures) = &err else {
+            panic!("expected Render, got {err}");
+        };
+        assert_eq!(failures[0].kind, RenderFailureKind::Unsupplied);
+        assert_eq!(failures[0].missing, ["this.x"]);
+
+        // An older chum recorded only values, so the name wasn't supplied.
+        let older = Some(Recorded {
+            vars: &rec,
+            records_unsets: false,
+        });
+        let p = migrator
+            .prepare([(migrator.down(5).unwrap(), older)])
+            .unwrap();
+        assert_eq!(p[0].statements, ["DROP none/Y"]);
+        let x = p[0].used.iter().find(|u| u.name == "this.x").unwrap();
+        assert_eq!((x.value.as_deref(), x.origin), (None, Origin::Recorded));
+        assert_eq!(p[0].record.get("this.x"), Some(&None));
+
+        // A supplied value still fills the gap.
+        let migrator = migrator.vars(Vars::new().with_this(5, "x", "X"));
+        let p = migrator
+            .prepare([(migrator.down(5).unwrap(), older)])
+            .unwrap();
+        assert_eq!(p[0].statements, ["DROP X/Y"]);
+    }
+
+    #[test]
     fn conflicts_on_names_the_template_does_not_read_are_ignored() {
         // A stale `<version>_cutoff` left in a deploy spec must not block a
         // migration that never reads `this.cutoff`.
@@ -1633,7 +1711,7 @@ mod tests {
         );
         let rec = recorded(&[("this.cutoff", "T")]);
         let p = migrator
-            .prepare([(migrator.down(5).unwrap(), Some(&rec))])
+            .prepare([(migrator.down(5).unwrap(), Some(current(&rec)))])
             .expect("no conflict for an unread name");
         assert_eq!(p[0].statements, ["DROP o"]);
         assert!(!p[0].record.contains_key("this.cutoff"));
@@ -1645,7 +1723,7 @@ mod tests {
             .vars(Vars::new().with_env("tier", "staging"));
         let rec = recorded(&[("env.tier", "prod"), ("env.region", "eu")]);
         let p = migrator
-            .prepare([(migrator.down(5).unwrap(), Some(&rec))])
+            .prepare([(migrator.down(5).unwrap(), Some(current(&rec)))])
             .unwrap();
         assert_eq!(p[0].statements, ["staging/eu"]);
         assert!(migrator.var_notices().contains(&VarNotice::EnvChanged {

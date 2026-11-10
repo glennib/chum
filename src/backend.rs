@@ -39,6 +39,29 @@
 //! If step 2 fails partway, the latest marker stays `success = false` and the
 //! version reads as dirty until resolved with `chum reset` or `chum force`.
 //!
+//! # Upgrading a table an older chum created
+//!
+//! [`ensure_table`] creates the current schema, but `CREATE TABLE IF NOT
+//! EXISTS` leaves a table an older chum created as it was. Each release so far
+//! has only added columns:
+//!
+//! | chum           | columns added                                |
+//! |----------------|----------------------------------------------|
+//! | 0.1.0 – 0.2.5  | `version` … `seq` (the base schema)          |
+//! | 0.3.0 – 0.5.0  | `vars`                                       |
+//! | after 0.5.0    | `unset`, `records_unsets`                    |
+//!
+//! [`upgrade_table`] adds whichever of [`ADDED_COLUMNS`] are missing, so it
+//! brings a table from any of these up to date in one `ALTER`; read-only
+//! commands read a missing column as its default instead (see
+//! [`list_applied`]). An older chum keeps writing to the upgraded table, since
+//! it names its columns on insert and select; its rows get each added column's
+//! default.
+//!
+//! `records_unsets` tells a row with no unsets apart from a row written before
+//! unsets were recorded: it is `false` for every row an older chum wrote,
+//! before or after the upgrade, and `true` for every row this chum writes.
+//!
 //! # Cross-replica consistency
 //!
 //! The append-only + `argMax` design above makes a read correct regardless of
@@ -153,6 +176,7 @@ struct AppliedRow {
     succeeded_before: bool,
     vars: Vec<(String, String)>,
     unset: Vec<String>,
+    records_unsets: bool,
 }
 
 /// Create the bookkeeping database if it does not already exist.
@@ -195,7 +219,8 @@ pub async fn ensure_table(client: &clickhouse::Client, bookkeeping: &Bookkeeping
              applied_at   DateTime64(3, 'UTC') DEFAULT now64(3),
              seq          UInt64,
              vars         Map(String, String),
-             unset        Array(String)
+             unset        Array(String),
+             records_unsets Bool DEFAULT false
          )
          ENGINE = MergeTree
          ORDER BY (version, seq)"
@@ -205,17 +230,19 @@ pub async fn ensure_table(client: &clickhouse::Client, bookkeeping: &Bookkeeping
 }
 
 /// The columns added after the bookkeeping table's first release: `vars`
-/// (the recorded variable values) and `unset` (the `this.*` names a version
-/// was applied without).
-const ADDED_COLUMNS: [&str; 2] = ["vars", "unset"];
+/// (the recorded variable values), `unset` (the `this.*` names a version was
+/// applied without) and `records_unsets` (whether the row fills `unset`).
+const ADDED_COLUMNS: [&str; 3] = ["vars", "unset", "records_unsets"];
 
-/// The statement that adds the `vars` and `unset` columns to a bookkeeping
-/// table created by an older chum. It is idempotent.
+/// The statement that adds every column in [`ADDED_COLUMNS`] to a bookkeeping
+/// table created by an older chum. It is idempotent, so it upgrades a table
+/// missing any subset of them.
 #[must_use]
 pub fn upgrade_statement(bookkeeping: &Bookkeeping) -> String {
     format!(
         "ALTER TABLE {} ADD COLUMN IF NOT EXISTS vars Map(String, String), \
-         ADD COLUMN IF NOT EXISTS unset Array(String)",
+         ADD COLUMN IF NOT EXISTS unset Array(String), \
+         ADD COLUMN IF NOT EXISTS records_unsets Bool DEFAULT false",
         bookkeeping.qualified()
     )
 }
@@ -228,10 +255,11 @@ async fn added_columns(
     let names: Vec<String> = client
         .query(
             "SELECT name FROM system.columns \
-             WHERE database = ? AND table = ? AND name IN ('vars', 'unset')",
+             WHERE database = ? AND table = ? AND name IN ?",
         )
         .bind(bookkeeping.database())
         .bind(bookkeeping.table())
+        .bind(ADDED_COLUMNS)
         .fetch_all()
         .await?;
     Ok(names.into_iter().collect())
@@ -261,8 +289,8 @@ pub async fn has_unset_column(
     Ok(added_columns(client, bookkeeping).await?.contains("unset"))
 }
 
-/// Add the `vars` and `unset` columns to a bookkeeping table that lacks
-/// either, returning the statement that was run, or `None` when both were
+/// Add the columns in [`ADDED_COLUMNS`] to a bookkeeping table that lacks any
+/// of them, returning the statement that was run, or `None` when all were
 /// already there.
 ///
 /// Only commands that write bookkeeping rows call this; read-only commands
@@ -298,7 +326,9 @@ pub async fn upgrade_table(
 /// Return the latest recorded state of each version, ordered ascending.
 ///
 /// A table without the `vars` or `unset` column reads every version's values
-/// or unset names as empty. An unset name reads as a `None` value.
+/// or unset names as empty, and one without `records_unsets` reads it as
+/// `false`, the value an older chum's rows get. An unset name reads as a
+/// `None` value.
 ///
 /// A dirty version with an earlier `success = true` marker reads as
 /// [`reverting`](AppliedMigration::reverting): only a revert appends a `false`
@@ -323,6 +353,11 @@ pub async fn list_applied(
     } else {
         "CAST([], 'Array(String)')"
     };
+    let records_unsets = if present.contains("records_unsets") {
+        "argMax(records_unsets, seq)"
+    } else {
+        "false"
+    };
     // `bk.success` names the column: a bare `success` inside `max` resolves to
     // the `argMax` alias, which ClickHouse rejects as a nested aggregate.
     let sql = format!(
@@ -334,7 +369,8 @@ pub async fn list_applied(
                 argMax(success, seq)      AS success,
                 max(bk.success)           AS succeeded_before,
                 {vars}                    AS vars,
-                {unset}                   AS unset
+                {unset}                   AS unset,
+                {records_unsets}          AS records_unsets
          FROM {table} AS bk
          GROUP BY version
          ORDER BY version"
@@ -356,6 +392,7 @@ pub async fn list_applied(
                 .map(|(k, v)| (k, Some(v)))
                 .chain(r.unset.into_iter().map(|k| (k, None)))
                 .collect(),
+            records_unsets: r.records_unsets,
         })
         .collect())
 }
@@ -366,7 +403,7 @@ pub async fn list_applied(
 ///
 /// `applied_at` falls back to its `DEFAULT now64(3)`; `seq` is a server-side
 /// nanosecond counter so the latest marker per version is unambiguous. The
-/// table must have the `vars` and `unset` columns (see [`upgrade_table`]).
+/// table must have every column in [`ADDED_COLUMNS`] (see [`upgrade_table`]).
 ///
 /// # Errors
 ///
@@ -386,6 +423,7 @@ pub async fn record(
         execution_ms,
         success,
         vars,
+        records_unsets: true,
     };
     insert_marker(client, bookkeeping, &marker).await
 }
@@ -409,6 +447,7 @@ pub(crate) async fn record_revert_started(
         execution_ms: 0,
         success: false,
         vars: &applied.vars,
+        records_unsets: applied.records_unsets,
     };
     insert_marker(client, bookkeeping, &marker).await
 }
@@ -421,6 +460,9 @@ struct Marker<'a> {
     execution_ms: u64,
     success: bool,
     vars: &'a BTreeMap<String, Option<String>>,
+    /// Whether `vars` lists every name the version was applied without; see
+    /// [`AppliedMigration::records_unsets`].
+    records_unsets: bool,
 }
 
 async fn insert_marker(
@@ -431,10 +473,11 @@ async fn insert_marker(
     let table = bookkeeping.qualified();
     let sql = format!(
         "INSERT INTO {table}
-             (version, description, checksum, execution_ms, success, seq, vars, unset)
+             (version, description, checksum, execution_ms, success, seq, vars, unset,
+              records_unsets)
          SELECT ?, ?, ?, ?, ?, toUnixTimestamp64Nano(now64(9)),
                 CAST(mapFromArrays(?, ?), 'Map(String, String)'),
-                CAST(?, 'Array(String)')"
+                CAST(?, 'Array(String)'), ?"
     );
     let (keys, values): (Vec<&str>, Vec<&str>) = marker
         .vars
@@ -457,6 +500,7 @@ async fn insert_marker(
         .bind(keys)
         .bind(values)
         .bind(unset)
+        .bind(marker.records_unsets)
         .execute()
         .await?;
     Ok(())

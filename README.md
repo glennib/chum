@@ -650,11 +650,18 @@ Each marker also records, in a `vars Map(String, String)` column, the template
 variables the migration used, and in an `unset Array(String)` column the
 `this.*` names it was [unset](#supplied-or-unset) for (see
 [Templated migrations](#when-templates-render-and-which-values-they-get)); plain
-migrations record them empty. A table created by an older chum lacks one or
-both columns: commands that write markers (`run`, `revert`, `force`) add them
-with `ALTER TABLE … ADD COLUMN IF NOT EXISTS`, and read-only commands treat them
-as empty without altering the table. An older chum keeps working against the
-upgraded table, since it names its columns.
+migrations record them empty. A `records_unsets Bool` column marks the markers
+that record unsets.
+
+A table created by an older chum lacks some of these columns: chum 0.1.0–0.2.5
+created none of them, and 0.3.0–0.5.0 only `vars`. Commands that write markers
+(`run`, `revert`, `force`) add the missing ones with a single `ALTER TABLE … ADD
+COLUMN IF NOT EXISTS`, and read-only commands treat them as empty without
+altering the table. An older chum keeps working against the upgraded table,
+since it names its columns, and its markers read as not recording unsets. A
+version applied by an older chum therefore records only values: `revert` and
+`force` read a `this.*` name its templates refer to but its marker lacks as
+unset, since that chum was given no value for it.
 
 `chum` does **not** adopt databases previously migrated by another tool — an
 already-migrated database must be handled manually (e.g. `chum force` each

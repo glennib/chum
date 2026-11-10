@@ -173,8 +173,8 @@ pub enum ChumError {
     )]
     ClickHouse(#[from] clickhouse::error::Error),
 
-    /// Adding the `vars` and `unset` columns to an existing bookkeeping table
-    /// failed, usually because chum's user lacks `ALTER` on it.
+    /// Adding the columns an older chum's bookkeeping table lacks failed,
+    /// usually because chum's user lacks `ALTER` on it.
     #[error("failed to upgrade the bookkeeping table")]
     #[cfg_attr(
         feature = "diagnostic",
