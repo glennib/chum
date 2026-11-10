@@ -92,7 +92,8 @@ these migrations must afterward be reset (drop and recreate the database, then
 re-run `chum run`) or have each new version `chum force`d. Convert before a
 migration set is widely deployed. `convert` keeps the extension of
 [templated migrations](#templated-migrations) as spelled, and reminds you to rename any
-version-prefixed `--var` / `CHUM_VAR_*` keys for the renumbered versions.
+version-prefixed `--var` / `--unset` / `CHUM_VAR_*` / `CHUM_UNSET_*` keys for
+the renumbered versions.
 
 ## Templated migrations
 
@@ -146,7 +147,8 @@ and giving the same key twice from one source is an error.
 reaches `this.cutoff`. Both namespaces always exist, so `is defined`,
 `| default(…)` and `env.get("x")` work on a missing key. The template author
 decides each variable's kind; to let an operator override an environment value
-for one migration, write `{{ this.tier | default(env.tier) }}`.
+for one migration, write `{{ this.tier | default(env.tier) }}` (and pass
+`--unset <version>_tier` where there is no override, see below).
 
 Values are strings. Two filters quote them for SQL:
 
@@ -180,25 +182,57 @@ formats depend on the server's `cast_string_to_date_time_mode`.
 An unfiltered `{{ env.x }}` inserts the value verbatim, which is right for
 numbers and SQL fragments. Compare values (`{% if env.tier == "prod" %}`)
 rather than testing their truthiness: every non-empty string is true, `"false"`
-included. Prefer a required, compared value over `is defined` wherever a
-missing value is dangerous, since `is defined` turns a misspelt key into a
-silently skipped branch.
+included. For `env.*`, prefer a required, compared value over `is defined`
+wherever a missing value is dangerous, since `is defined` turns a misspelt key
+into a silently skipped branch; `this.*` names are covered by
+[supplied or unset](#supplied-or-unset).
 
 Jinja processes the whole file, so `-- {{ env.x }}` still needs `env.x`; use
 `{# … #}` for comments about the template. SQL that contains Jinja syntax must
 be wrapped in `{% raw %}…{% endraw %}`. `include`, `import` and `extends` are
 not available: every template is self-contained.
 
-chum warns about a supplied key that no template in the source refers to (a
-typo such as `CHUM_VAR_teir`), and about a `--var` that no migration rendered
-by the command used.
+chum warns about a supplied or unset key that no template in the source refers
+to (a typo such as `CHUM_VAR_teir`), and about a `--var` or `--unset` that no
+migration rendered by the command used.
+
+### Supplied or unset
+
+A `this.*` value is decided for one apply, and running without one can be a
+valid decision: the [cutoff example](#example-a-materialized-view-with-a-future-cutoff)
+needs no cutoff in an empty database. A template handles that with
+`is defined` or `| default(…)`, but then a forgotten or misspelt key
+(`CHUM_VAR_20261106120000_cutof`) would quietly take the no-value branch. So
+every `this.*` name a version's templates refer to must be either supplied or
+**unset**:
+
+```bash
+chum run --var 20261106120000_cutoff=2026-11-07T00:00:00Z   # with a cutoff
+chum run --unset 20261106120000_cutoff                      # deliberately without
+```
+
+`--unset <version>_<name>` (repeatable) or `CHUM_UNSET_<version>_<name>` with an
+empty value supplies the name as unset: the template sees it as missing, so
+`is defined` is false and `| default(…)` applies, while reading it without a
+fallback is still a missing-value error. A name that is neither supplied nor
+unset is an error before anything runs, listing every such name. The names
+that count are those written in the version's up and down templates, in every
+branch, so applying a version also needs a decision for a name only its down
+uses. A flag wins over the environment, as for values, and one source can't both
+set and unset a key. Only `this.*` names can be unset: `env.*` values describe
+the environment rather than one apply.
+
+chum has to see every `this.*` name a template uses, so templates name each
+one: reading `this` by a computed name (`this.get(…)`, `this[…]`, or `this` as a
+whole) is a template mistake that [`chum check`](#checking-chum-check) reports.
+`env` can be read either way.
 
 ### When templates render, and which values they get
 
 | Command | Renders | Variables from |
 | --- | --- | --- |
-| `render` (offline) | the requested migrations | `--var`, `CHUM_VAR_*` |
-| `run`, `run --dry-run` | every pending migration up to `--target` | `--var`, `CHUM_VAR_*` |
+| `render` (offline) | the requested migrations | `--var`, `--unset`, `CHUM_VAR_*`, `CHUM_UNSET_*` |
+| `run`, `run --dry-run` | every pending migration up to `--target` | `--var`, `--unset`, `CHUM_VAR_*`, `CHUM_UNSET_*` |
 | `revert`, `revert --dry-run` | the down of each version reverted | supplied and recorded |
 | `force <version>` | the up, without executing it | supplied and recorded |
 | `check` (offline) | nothing; checks every template | none |
@@ -206,22 +240,23 @@ by the command used.
 
 `run` checks, renders and splits every pending migration before the first one
 runs, and `revert` does the same with its downs, so a template mistake, a
-missing variable or an invalid value anywhere aborts the command before any
-migration statement runs, listing every migration that failed. The check comes
+missing variable, a `this.*` name neither supplied nor unset, or an invalid
+value anywhere aborts the command before any migration statement runs, listing
+every migration that failed. The check comes
 first and covers every branch of the template (see [`chum
 check`](#checking-chum-check)). `run --dry-run` lists each value it would use
-and where it came from (`--var`, environment, recorded or default).
+and where it came from (`--var`, `--unset`, environment, recorded or default).
 
 Each bookkeeping marker records the values the migration used, as namespaced
 keys (`env.tier`, `this.cutoff`): the values the up looked up while rendering,
 plus every supplied value its down refers to. Values from `| default(…)` aren't
 recorded. `revert` and `force` use them:
 
-- **`this.*`: recorded values win.** A supplied value that differs from the
-  recorded one is an error if the migration being rendered reads that name, and
-  is ignored otherwise, so a stale value left in a deploy spec can't block a
-  migration that doesn't use it. A supplied value for a name that wasn't
-  recorded fills the gap.
+- **`this.*`: recorded values win.** A supplied value or unset that differs
+  from the recorded value is an error if the migration being rendered reads that
+  name, and is ignored otherwise, so a stale value left in a deploy spec can't
+  block a migration that doesn't use it. A supplied value or unset for a name
+  that wasn't recorded fills the gap.
 - **`env.*`: supplied values win**, since the environment may have changed since
   the apply; recorded values fill gaps, and chum warns when a supplied value
   differs from the recorded one.
@@ -248,7 +283,7 @@ ClickHouse, so it works in CI or code review and doubles as a pre-flight check:
 it fails exactly where `run` would.
 
 ```text
-chum render [VERSION]... [--from VERSION] [--down] [--var key=value]...
+chum render [VERSION]... [--from VERSION] [--down] [--var key=value]... [--unset key]...
 ```
 
 With versions it renders those; with `--from`, every migration from that
@@ -268,6 +303,7 @@ finds these without values and without connecting to ClickHouse, in every
 branch of every template:
 
 - syntax errors;
+- reading `this` by a computed name (see [supplied or unset](#supplied-or-unset));
 - unknown filters and tests;
 - chum's filters called with the wrong number of arguments, such as
   `sql_datetime64` without its precision.
@@ -303,8 +339,8 @@ hand). It refuses a version that isn't dirty.
 Every migration also runs in every fresh database (a laptop, CI, a rebuild), so
 guard on the condition that makes a value necessary, such as whether the
 affected table has data, rather than on a particular environment. `chum render
---from <version>` with a local `env.*` and no `this.*` shows whether a fresh
-database can migrate without per-apply values.
+--from <version>` with a local `env.*` and every `this.*` unset shows whether a
+fresh database can migrate without per-apply values.
 
 ### Example: a materialized view with a future cutoff
 
@@ -346,10 +382,12 @@ The guards decide whether a cutoff is needed from the data, not from the
 environment's name. Once `app.events` has data (staging, production), a cutoff
 is required and must be in the future. While it is empty (a laptop, CI, a new or
 rebuilt database), the view covers everything from the start, there is nothing
-to backfill, and any cutoff or none is accepted.
+to backfill, and any cutoff or none is accepted. Running without one is still
+an explicit choice:
 
 ```bash
 chum run --url "$STAGING_URL" --var 20261106120000_cutoff=2026-11-06T14:00:00Z
+chum run --url "$LOCAL_URL" --unset 20261106120000_cutoff
 ```
 
 Where chum runs as a Kubernetes Job, the release that ships the migration adds
@@ -426,6 +464,7 @@ accepts.
 | `--strict-consistency` | `CHUM_STRICT_CONSISTENCY` | off | `run`, `revert`, `info`, `force`, `reset` | Apply the [cross-replica consistency](#cross-replica-consistency) settings |
 | `--source` | `CHUM_SOURCE` | `migrations` | every subcommand but `reset` | Migration directory |
 | `--var <key>=<value>` | `CHUM_VAR_<key>` | — | `run`, `revert`, `render`, `force` | A variable for [templated migrations](#templated-migrations). Repeatable. A plain key sets `env.<key>`; a version-prefixed key (`<version>_<name>`) sets `this.<name>` for that version only. `--var` wins over `CHUM_VAR_<key>`. |
+| `--unset <version>_<name>` | `CHUM_UNSET_<version>_<name>` (empty value) | — | `run`, `revert`, `render`, `force` | Run the version without `this.<name>`. Repeatable. Every `this.*` name a version's templates refer to must be supplied or unset (see [supplied or unset](#supplied-or-unset)). A flag wins over the environment. |
 | `--yes`, `-y` | — | — | `revert`, `reset` | Skip the confirmation prompt; required when not interactive |
 | `--format` | — | `auto` | every subcommand | `auto` \| `pretty` \| `json` \| `tsv` (`auto` = table on a tty, TSV when piped) |
 | `--json` | — | — | every subcommand | Shorthand for `--format json` |
@@ -467,10 +506,11 @@ app database that may not exist yet, breaking the create-your-own-database flow
 (below) even though bookkeeping lives in `--bookkeeping-database`.
 
 Only `CHUM_TABLE`, `CHUM_BOOKKEEPING_DATABASE`, `CHUM_SOURCE` and the
-`CHUM_VAR_<key>` template variables are env-readable — those are `CHUM_*` tool
-config, not part of the connection target. `CHUM_VAR_<key>` is the one family
-clap can't declare, because the prefix is dynamic: chum reads every environment
-variable starting with `CHUM_VAR_` and nothing else, so an unrelated `PATH` or
+`CHUM_VAR_<key>` / `CHUM_UNSET_<key>` template variables are env-readable —
+those are `CHUM_*` tool config, not part of the connection target.
+`CHUM_VAR_<key>` and `CHUM_UNSET_<key>` are the families clap can't declare,
+because the names are dynamic: chum reads every environment variable starting
+with `CHUM_VAR_` or `CHUM_UNSET_` and nothing else, so an unrelated `PATH` or
 `CLICKHOUSE_URL` never reaches a template.
 
 ### `--database` vs `--bookkeeping-database`
@@ -537,9 +577,10 @@ migrator.run(&client, &bookkeeping, None).await?;
 
 Templated migrations need the `template` feature (enabled by `cli`), which
 adds the `minijinja` dependency. Pass variables with `Migrator::vars`, e.g.
-`Vars::new().with_env("tier", "prod")`, or build them from `--var`-style keys
-with `Vars::from_keys`. Without the feature, a source containing a template
-fails to load with `TemplatingDisabled`.
+`Vars::new().with_env("tier", "prod")` and `Vars::with_unset(version, name)`,
+or build them from `--var` / `--unset`-style keys with `Vars::from_keys`.
+Without the feature, a source containing a template fails to load with
+`TemplatingDisabled`.
 
 `Migrator::check` runs the [`chum check`](#checking-chum-check) checks with no
 variables and no client, so a test can catch a template mistake at review time,

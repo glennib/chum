@@ -159,8 +159,9 @@ pub(crate) fn render(
 }
 
 /// Find the mistakes in the template `source` that don't depend on values: a
-/// syntax error, or, in every branch, an unknown filter or test or one of
-/// chum's filters called with the wrong number of arguments.
+/// syntax error, a read of `this` by a computed name, or, in every branch, an
+/// unknown filter or test or one of chum's filters called with the wrong
+/// number of arguments.
 ///
 /// minijinja resolves filters and tests only when an expression runs, so
 /// rendering alone misses them in a branch the supplied values don't take.
@@ -177,9 +178,23 @@ pub(crate) fn check(name: &str, source: &str) -> Vec<Failure> {
             }];
         }
     };
+    let mut failures = Vec::new();
+    // Every `this.*` name a version refers to must be supplied or unset, which
+    // can only be enforced for names written out in the template.
+    if template_references(&template).this.all {
+        failures.push(Failure {
+            message: format!(
+                "`this` is read by a computed name (`this.get(…)`, `this[…]`, or the namespace \
+                 as a whole) in {name}; refer to each value as `this.<name>` so chum can tell \
+                 which values the version needs"
+            ),
+            missing: Vec::new(),
+            kind: RenderFailureKind::Template,
+            span: None,
+        });
+    }
     let compiled = machinery::get_compiled_template(&template);
     let mut state = template.new_state();
-    let mut failures = Vec::new();
     for instructions in std::iter::once(&compiled.instructions).chain(compiled.blocks.values()) {
         for idx in 0.. {
             let Some(instruction) = instructions.get(idx) else {
@@ -264,6 +279,10 @@ pub(crate) fn references(name: &str, source: &str) -> References {
     let Ok(template) = environment.template_from_named_str(name, source) else {
         return References::default();
     };
+    template_references(&template)
+}
+
+fn template_references(template: &minijinja::Template<'_, '_>) -> References {
     let mut refs = References::default();
     for var in template.undeclared_variables(true) {
         let mut parts = var.split('.');
@@ -1026,6 +1045,23 @@ mod tests {
 {% for i in range(3) %}{{ i | string | sql_ident }}{% endfor %}
 {{ this.d | sql_date }} {{ this.t | sql_datetime }}",
         );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn check_rejects_this_read_by_a_computed_name() {
+        for source in [
+            "{{ this.get('cutoff') }}",
+            "{{ this['cutoff'] }}",
+            "{% for k, v in this | items %}{{ v }}{% endfor %}",
+            "{% if this %}x{% endif %}",
+        ] {
+            let found = checked(source);
+            assert_eq!(found.len(), 1, "{source}: {found:?}");
+            assert!(found[0].0.starts_with("`this` is read by a computed name"));
+        }
+        // `env` may be read by a computed name.
+        let found = checked("{{ env.get('x', 'y') }}{{ env['x'] }}");
         assert!(found.is_empty(), "{found:?}");
     }
 

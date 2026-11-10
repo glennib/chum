@@ -215,8 +215,10 @@ pub enum ChumError {
             code(chum::invalid_var_key),
             help(
                 "A plain key (`tier`) sets `env.tier` for every migration; a version-prefixed \
-                 key (`20261106120000_cutoff`) sets `this.cutoff` for that version only. Names \
-                 match `[A-Za-z_][A-Za-z0-9_]*`, and each key may be given once per source."
+                 key (`20261106120000_cutoff`) sets `this.cutoff` for that version only, and only \
+                 such a key can be unset. Names match `[A-Za-z_][A-Za-z0-9_]*`. Each key may be \
+                 given once per source: once among `--var` and `--unset`, once among `CHUM_VAR_*` \
+                 and `CHUM_UNSET_*`."
             )
         )
     )]
@@ -260,8 +262,8 @@ pub enum ChumError {
     /// describes what actually ran, so it wins, and a different supplied
     /// value is a mistake rather than an override.
     #[error(
-        "{key} supplies {name} = {supplied:?} for version {version}, but it was applied with \
-         {recorded:?}"
+        "{key} supplies {name} {} for version {version}, but it was applied with {recorded:?}",
+        supplied_as(.supplied.as_deref())
     )]
     #[cfg_attr(
         feature = "diagnostic",
@@ -269,7 +271,7 @@ pub enum ChumError {
             code(chum::var_conflict),
             help(
                 "Recorded `this.*` values win when reverting or forcing a version. Drop the \
-                 supplied value, or pass the recorded one."
+                 supplied value or `--unset`, or pass the recorded value."
             )
         )
     )]
@@ -281,8 +283,8 @@ pub enum ChumError {
         /// Where the conflicting value was supplied, e.g.
         /// `--var 20261106120000_cutoff`.
         key: String,
-        /// The supplied value.
-        supplied: String,
+        /// The supplied value, or `None` for a name supplied as unset.
+        supplied: Option<String>,
         /// The recorded value.
         recorded: String,
     },
@@ -350,6 +352,10 @@ pub struct RenderFailure {
 pub enum RenderFailureKind {
     /// A variable the template needs has no value.
     MissingValue,
+    /// The version refers to `this.*` names that were neither supplied nor
+    /// unset, listed in [`RenderFailure::missing`]. The template was not
+    /// rendered.
+    Unsupplied,
     /// A filter rejected a supplied value, e.g. `sql_datetime` given a time
     /// without an offset.
     InvalidValue,
@@ -469,9 +475,22 @@ impl fmt::Display for RenderFailure {
         )?;
         if !self.missing.is_empty() {
             let names: Vec<String> = self.missing.iter().map(|m| format!("`{m}`")).collect();
-            write!(f, "; no value was supplied for {}", names.join(", "))?;
+            let sep = if self.kind == RenderFailureKind::Unsupplied {
+                ":"
+            } else {
+                "; no value was supplied for"
+            };
+            write!(f, "{sep} {}", names.join(", "))?;
         }
         Ok(())
+    }
+}
+
+/// `= "value"`, or `as unset`.
+fn supplied_as(value: Option<&str>) -> String {
+    match value {
+        Some(value) => format!("= {value:?}"),
+        None => "as unset".to_owned(),
     }
 }
 
@@ -523,6 +542,14 @@ fn render_help(failures: &[RenderFailure]) -> String {
             "Supply each missing value with `--var <key>=<value>` or `CHUM_VAR_<key>=<value>`: a \
              plain key (`tier`) for `env.tier`, a version-prefixed key (`<version>_cutoff`) for \
              `this.cutoff`.",
+        );
+    }
+    if has(RenderFailureKind::Unsupplied) {
+        sentences.push(
+            "Every `this.*` name a version's templates refer to must be supplied or unset, so a \
+             forgotten or misspelt key can't silently skip a branch: pass `--var \
+             <version>_<name>=<value>`, or `--unset <version>_<name>` to run it without that \
+             value (`CHUM_VAR_<key>=<value>` and `CHUM_UNSET_<key>=` in the environment).",
         );
     }
     if has(RenderFailureKind::InvalidValue) {

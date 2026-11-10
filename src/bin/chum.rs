@@ -379,10 +379,15 @@ impl SourceArgs {
         Ok(Migrator::new(source::from_path(dir)?))
     }
 
-    /// A migrator whose templates render with `--var` and `CHUM_VAR_*`.
+    /// A migrator whose templates render with `--var`, `--unset`,
+    /// `CHUM_VAR_*` and `CHUM_UNSET_*`.
     fn migrator_with(&self, var: &VarArgs) -> miette::Result<Migrator> {
-        let VarArgs { vars } = var;
-        let vars = Vars::from_keys(vars.iter().cloned(), env_vars(std::env::vars_os())?)?;
+        let VarArgs { vars, unset } = var;
+        let flags = vars
+            .iter()
+            .map(|(key, value)| (key.clone(), Some(value.clone())))
+            .chain(unset.iter().map(|key| (key.clone(), None)));
+        let vars = Vars::from_keys(flags, env_vars(std::env::vars_os())?)?;
         Ok(self.migrator()?.vars(vars))
     }
 }
@@ -494,7 +499,7 @@ impl BookkeepingArgs {
     }
 }
 
-/// `--var`, for the subcommands that render templates.
+/// `--var` and `--unset`, for the subcommands that render templates.
 #[derive(Debug, clap::Args)]
 struct VarArgs {
     /// Set a variable for templated (`.sql.j2` / `.j2.sql`) migrations.
@@ -506,6 +511,18 @@ struct VarArgs {
     /// variables; `--var` wins for the same key.
     #[arg(long = "var", value_name = "KEY=VALUE", value_parser = parse_var)]
     vars: Vec<(String, String)>,
+
+    /// Run a version without a `this.*` value its templates refer to.
+    /// Repeatable.
+    ///
+    /// Takes a version-prefixed key (`20261106120000_cutoff`). Every `this.*`
+    /// name a version's templates refer to must be supplied with `--var` or
+    /// unset, so a forgotten or misspelt key is an error rather than a silently
+    /// skipped branch. Also read from `CHUM_UNSET_<key>` environment variables
+    /// (with an empty value); a flag wins over the environment for the same
+    /// key, and one source may not both set and unset a key.
+    #[arg(long, value_name = "KEY")]
+    unset: Vec<String>,
 }
 
 /// `--yes`, for the subcommands that ask before changing bookkeeping.
@@ -527,20 +544,35 @@ fn parse_var(arg: &str) -> Result<(String, String), String> {
 /// The prefix of the environment variables that supply template variables.
 const VAR_PREFIX: &str = "CHUM_VAR_";
 
-/// Collect `CHUM_VAR_<key>` variables as `(key, value)` pairs. The rest of the
-/// environment is never read, so it can't reach a template.
+/// The prefix of the environment variables that unset template variables.
+const UNSET_PREFIX: &str = "CHUM_UNSET_";
+
+/// Collect `CHUM_VAR_<key>` variables as `(key, Some(value))` pairs and
+/// `CHUM_UNSET_<key>` variables as `(key, None)`. The rest of the environment
+/// is never read, so it can't reach a template.
 fn env_vars(
     environment: impl IntoIterator<Item = (OsString, OsString)>,
-) -> miette::Result<Vec<(String, String)>> {
+) -> miette::Result<Vec<(String, Option<String>)>> {
     let mut out = Vec::new();
     for (name, value) in environment {
-        let Some(key) = name.to_str().and_then(|n| n.strip_prefix(VAR_PREFIX)) else {
+        let Some(name) = name.to_str() else {
             continue;
         };
-        let value = value
-            .into_string()
-            .map_err(|_| miette!("the value of {VAR_PREFIX}{key} is not valid UTF-8"))?;
-        out.push((key.to_owned(), value));
+        if let Some(key) = name.strip_prefix(VAR_PREFIX) {
+            let value = value
+                .into_string()
+                .map_err(|_| miette!("the value of {name} is not valid UTF-8"))?;
+            out.push((key.to_owned(), Some(value)));
+        } else if let Some(key) = name.strip_prefix(UNSET_PREFIX) {
+            // A value would suggest `false` or `0` keeps the variable set.
+            if !value.is_empty() {
+                miette::bail!(
+                    help = "Remove the variable to stop unsetting, or set it to an empty value.",
+                    "{name} must have an empty value"
+                );
+            }
+            out.push((key.to_owned(), None));
+        }
     }
     Ok(out)
 }
@@ -1029,14 +1061,16 @@ fn warn_vars(migrator: &Migrator) {
     for notice in migrator.var_notices() {
         match notice {
             VarNotice::Unreferenced { key, supplied } => tracing::warn!(
-                "{} sets {}, which no template in the source refers to",
-                supplied.origin.describe(&supplied.key),
+                "{} {} {}, which no template in the source refers to",
+                supplied.describe(),
+                sets(&supplied),
                 namespaced_for(&key),
             ),
             VarNotice::Unused { key, supplied } if supplied.origin == Origin::Flag => {
                 tracing::warn!(
-                    "{} sets {}, which no migration rendered by this command used",
-                    supplied.origin.describe(&supplied.key),
+                    "{} {} {}, which no migration rendered by this command used",
+                    supplied.describe(),
+                    sets(&supplied),
                     namespaced_for(&key),
                 );
             }
@@ -1051,6 +1085,15 @@ fn warn_vars(migrator: &Migrator) {
             ),
             _ => {}
         }
+    }
+}
+
+/// `sets`, or `unsets` for a name supplied as unset.
+fn sets(supplied: &chum::Supplied) -> &'static str {
+    if supplied.value.is_some() {
+        "sets"
+    } else {
+        "unsets"
     }
 }
 
@@ -1405,7 +1448,8 @@ fn render_plan(planned: &[chum::Planned], fmt: Resolved) -> miette::Result<()> {
                         format!(
                             "{} = {value} {}",
                             v.name,
-                            theme::muted().apply_to(format!("({})", v.origin))
+                            theme::muted()
+                                .apply_to(format!("({})", v.origin.label(v.value.is_none())))
                         )
                     })
                     .collect();
@@ -1457,7 +1501,7 @@ fn var_outs(vars: &[chum::UsedVar]) -> Vec<VarOut> {
         .map(|v| VarOut {
             name: v.name.clone(),
             value: v.value.clone(),
-            origin: v.origin.as_str(),
+            origin: v.origin.label(v.value.is_none()),
         })
         .collect()
 }
@@ -1981,9 +2025,9 @@ fn run_convert(dir: &Path, to: Scheme, dry_run: bool, fmt: Resolved) -> miette::
     render_convert(&plan, to, dry_run, fmt)
 }
 
-/// Renumbering orphans version-prefixed variables (`CHUM_VAR_<version>_<name>`,
-/// `--var <version>_<name>`) in deploy specs, so warn about each renumbered
-/// template version.
+/// Renumbering orphans version-prefixed keys (`CHUM_VAR_<version>_<name>`,
+/// `--var <version>_<name>`, and their `--unset` / `CHUM_UNSET_` forms) in
+/// deploy specs, so warn about each renumbered template version.
 fn remind_about_version_keys(files: &[source::MigrationFile], map: &HashMap<i64, String>) {
     let renumbered: BTreeMap<i64, &String> = files
         .iter()
@@ -1994,7 +2038,8 @@ fn remind_about_version_keys(files: &[source::MigrationFile], map: &HashMap<i64,
     for (old, new) in renumbered {
         tracing::warn!(
             "version {old} of a template is now {new}: rename version-prefixed variables such as \
-             {VAR_PREFIX}{old}_<name> or --var {old}_<name> to use {new}"
+             {VAR_PREFIX}{old}_<name>, {UNSET_PREFIX}{old}_<name>, --var {old}_<name> or --unset \
+             {old}_<name> to use {new}"
         );
     }
 }
@@ -2152,21 +2197,22 @@ mod tests {
             "table",
             "bookkeeping-database",
         ];
+        const VAR: &[&str] = &["var", "unset"];
         let expected: &[(&str, &[&[&str]])] = &[
-            ("run", &[&["target", "dry-run", "var"], SOURCE, DB]),
+            ("run", &[&["target", "dry-run"], VAR, SOURCE, DB]),
             (
                 "revert",
-                &[&["target", "steps", "dry-run", "yes", "var"], SOURCE, DB],
+                &[&["target", "steps", "dry-run", "yes"], VAR, SOURCE, DB],
             ),
             ("info", &[SOURCE, DB]),
-            ("render", &[&["from", "down", "var"], SOURCE]),
+            ("render", &[&["from", "down"], VAR, SOURCE]),
             ("check", &[&["from"], SOURCE]),
             (
                 "add",
                 &[&["sequential", "template", "template-ext"], SOURCE],
             ),
             ("convert", &[&["dry-run"], SOURCE]),
-            ("force", &[&["var"], SOURCE, DB]),
+            ("force", &[VAR, SOURCE, DB]),
             ("reset", &[&["yes"], DB]),
         ];
         let cli = Cli::command();
@@ -2441,10 +2487,23 @@ mod tests {
     }
 
     #[test]
-    fn only_chum_var_environment_variables_are_read() {
+    fn unset_takes_a_bare_key() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from(["chum", "revert", "--unset", "5_cutoff", "--unset", "6_x"])
+            .expect("valid args parse");
+        let Command::Revert { var, .. } = cli.command else {
+            panic!("expected revert");
+        };
+        assert_eq!(var.unset, ["5_cutoff", "6_x"]);
+        assert!(Cli::try_parse_from(["chum", "info", "--unset", "5_x"]).is_err());
+    }
+
+    #[test]
+    fn only_chum_var_and_chum_unset_environment_variables_are_read() {
         let env = [
             ("CHUM_VAR_tier", "prod"),
             ("CHUM_VAR_20261106120000_cutoff", "T"),
+            ("CHUM_UNSET_5_x", ""),
             ("PATH", "/bin"),
             ("CLICKHOUSE_URL", "http://x"),
             ("CHUM_TABLE", "t"),
@@ -2454,10 +2513,19 @@ mod tests {
         assert_eq!(
             vars,
             [
-                ("tier".to_owned(), "prod".to_owned()),
-                ("20261106120000_cutoff".to_owned(), "T".to_owned())
+                ("tier".to_owned(), Some("prod".to_owned())),
+                ("20261106120000_cutoff".to_owned(), Some("T".to_owned())),
+                ("5_x".to_owned(), None),
             ]
         );
+    }
+
+    #[test]
+    fn chum_unset_must_be_empty() {
+        let env =
+            [("CHUM_UNSET_5_x", "false")].map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let err = env_vars(env).expect_err("a value");
+        assert!(err.to_string().contains("CHUM_UNSET_5_x"), "{err}");
     }
 
     #[test]

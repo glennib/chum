@@ -8,9 +8,15 @@
 //! version `20261106120000`. A name can't start with a digit, so the leading
 //! digits of a key are unambiguously its version.
 //!
+//! A `this.*` name can also be supplied as *unset*: a decision that the
+//! version runs without that value, which a template sees as a missing name
+//! (`is defined` is false, `| default(…)` applies). Every `this.*` name a
+//! version's templates refer to must be supplied or unset, so a forgotten or
+//! misspelt key can't silently take a template's "no value" branch.
+//!
 //! The library never reads the process environment. A caller (the CLI) turns
-//! its `--var` and `CHUM_VAR_*` keys into a [`Vars`] with [`Vars::from_keys`],
-//! or builds one directly.
+//! its `--var`, `--unset`, `CHUM_VAR_*` and `CHUM_UNSET_*` keys into a
+//! [`Vars`] with [`Vars::from_keys`], or builds one directly.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -24,10 +30,10 @@ use crate::error::Result;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum Origin {
-    /// Supplied explicitly: `--var` on the command line, or set by a library
-    /// caller.
+    /// Supplied explicitly: `--var` or `--unset` on the command line, or set
+    /// by a library caller.
     Flag,
-    /// A `CHUM_VAR_<key>` environment variable.
+    /// A `CHUM_VAR_<key>` or `CHUM_UNSET_<key>` environment variable.
     Environment,
     /// The bookkeeping row of a version being reverted or forced.
     Recorded,
@@ -56,6 +62,27 @@ impl Origin {
             Origin::Flag => format!("--var {key}"),
             Origin::Environment => format!("CHUM_VAR_{key}"),
             Origin::Recorded | Origin::Default => key.to_owned(),
+        }
+    }
+
+    /// How a user wrote an unset `key` in this source: `--unset <key>` or
+    /// `CHUM_UNSET_<key>`.
+    #[must_use]
+    pub fn describe_unset(self, key: &str) -> String {
+        match self {
+            Origin::Flag => format!("--unset {key}"),
+            Origin::Environment => format!("CHUM_UNSET_{key}"),
+            Origin::Recorded | Origin::Default => key.to_owned(),
+        }
+    }
+
+    /// A short label for output, like [`Origin::as_str`], for a value that is
+    /// `unset`: `--unset` rather than `--var` for a flag.
+    #[must_use]
+    pub fn label(self, unset: bool) -> &'static str {
+        match self {
+            Origin::Flag if unset => "--unset",
+            _ => self.as_str(),
         }
     }
 }
@@ -102,12 +129,13 @@ impl VarKey {
     }
 }
 
-/// A supplied value and where it came from.
+/// A supplied value, or a supplied decision that there is none, and where it
+/// came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Supplied {
-    /// The value.
-    pub value: String,
+    /// The value, or `None` for a name supplied as unset.
+    pub value: Option<String>,
     /// Its source.
     pub origin: Origin,
     /// The key as the user spelled it (`0005_x` for a `this.x` of version 5),
@@ -120,9 +148,28 @@ impl Supplied {
     #[must_use]
     pub fn new(value: impl Into<String>, origin: Origin, key: impl Into<String>) -> Self {
         Self {
-            value: value.into(),
+            value: Some(value.into()),
             origin,
             key: key.into(),
+        }
+    }
+
+    /// A name supplied as unset.
+    #[must_use]
+    pub fn unset(origin: Origin, key: impl Into<String>) -> Self {
+        Self {
+            value: None,
+            origin,
+            key: key.into(),
+        }
+    }
+
+    /// How the user supplied it, e.g. `--var 5_x`, `CHUM_UNSET_5_x`.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self.value {
+            Some(_) => self.origin.describe(&self.key),
+            None => self.origin.describe_unset(&self.key),
         }
     }
 }
@@ -165,7 +212,18 @@ impl Vars {
         self
     }
 
-    /// Set a variable, replacing any earlier value.
+    /// Supply `this.<name>` for `version` as unset, replacing any earlier
+    /// value.
+    #[must_use]
+    pub fn with_unset(mut self, version: i64, name: impl Into<String>) -> Self {
+        let name = name.into();
+        let supplied = Supplied::unset(Origin::Flag, format!("{version}_{name}"));
+        self.insert(VarKey::This { version, name }, supplied);
+        self
+    }
+
+    /// Set a variable, replacing any earlier value. An unset `env.*` name
+    /// reads as missing; [`Vars::from_keys`] rejects one.
     pub fn insert(&mut self, key: VarKey, supplied: Supplied) {
         match key {
             VarKey::Env(name) => {
@@ -177,20 +235,24 @@ impl Vars {
         }
     }
 
-    /// Build variables from `--var` keys (`flags`) and `CHUM_VAR_*` keys
-    /// (`environment`, without the prefix), each a `(key, value)` pair.
+    /// Build variables from command-line keys (`flags`: `--var` with a value,
+    /// `--unset` with `None`) and environment keys (`environment`, without the
+    /// prefix: `CHUM_VAR_*` with a value, `CHUM_UNSET_*` with `None`).
     ///
-    /// A flag wins over an environment variable for the same key. Within one
-    /// source, a key may appear once; `0005_x` and `5_x` are the same key.
+    /// A flag wins over an environment variable for the same key, whether
+    /// either sets a value or unsets it. Within one source, a key may appear
+    /// once, so a key given both a value and unset there is an error; `0005_x`
+    /// and `5_x` are the same key.
     ///
     /// # Errors
     ///
     /// Returns [`ChumError::InvalidVarKey`] for a key that doesn't parse (see
-    /// [`parse_key`]) or that appears twice in one source.
+    /// [`parse_key`]), that appears twice in one source, or that unsets an
+    /// `env.*` name: only `this.*` names can be unset.
     pub fn from_keys<F, E>(flags: F, environment: E) -> Result<Self>
     where
-        F: IntoIterator<Item = (String, String)>,
-        E: IntoIterator<Item = (String, String)>,
+        F: IntoIterator<Item = (String, Option<String>)>,
+        E: IntoIterator<Item = (String, Option<String>)>,
     {
         let environment = collect(environment, Origin::Environment)?;
         let flags = collect(flags, Origin::Flag)?;
@@ -252,26 +314,33 @@ impl Vars {
 /// Parse and de-duplicate the keys of one source.
 fn collect<I>(pairs: I, origin: Origin) -> Result<BTreeMap<VarKey, Supplied>>
 where
-    I: IntoIterator<Item = (String, String)>,
+    I: IntoIterator<Item = (String, Option<String>)>,
 {
     let mut out: BTreeMap<VarKey, Supplied> = BTreeMap::new();
     for (key, value) in pairs {
-        let parsed = parse_key(&key).map_err(|reason| ChumError::InvalidVarKey {
-            key: origin.describe(&key),
+        let supplied = match value {
+            Some(value) => Supplied::new(value, origin, key),
+            None => Supplied::unset(origin, key),
+        };
+        let invalid = |reason: String| ChumError::InvalidVarKey {
+            key: supplied.describe(),
             reason,
-        })?;
+        };
+        let parsed = parse_key(&supplied.key).map_err(invalid)?;
+        if supplied.value.is_none() && matches!(parsed, VarKey::Env(_)) {
+            return Err(invalid(
+                "only a version-prefixed key (`<version>_<name>`) can be unset".to_owned(),
+            ));
+        }
         match out.entry(parsed) {
             Entry::Occupied(earlier) => {
-                return Err(ChumError::InvalidVarKey {
-                    key: origin.describe(&key),
-                    reason: format!(
-                        "supplied twice, also as {}",
-                        origin.describe(&earlier.get().key)
-                    ),
-                });
+                return Err(invalid(format!(
+                    "supplied twice, also as {}",
+                    earlier.get().describe()
+                )));
             }
             Entry::Vacant(slot) => {
-                slot.insert(Supplied::new(value, origin, key));
+                slot.insert(supplied);
             }
         }
     }
@@ -358,11 +427,15 @@ impl Refs {
 mod tests {
     use super::*;
 
-    fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
+    fn pairs(items: &[(&str, &str)]) -> Vec<(String, Option<String>)> {
         items
             .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .map(|(k, v)| ((*k).to_owned(), Some((*v).to_owned())))
             .collect()
+    }
+
+    fn unsets(keys: &[&str]) -> Vec<(String, Option<String>)> {
+        keys.iter().map(|k| ((*k).to_owned(), None)).collect()
     }
 
     #[test]
@@ -416,7 +489,7 @@ mod tests {
         )
         .unwrap();
         let tier = &vars.env()["tier"];
-        assert_eq!(tier.value, "prod");
+        assert_eq!(tier.value.as_deref(), Some("prod"));
         assert_eq!(tier.origin, Origin::Flag);
         assert_eq!(vars.env()["region"].origin, Origin::Environment);
     }
@@ -442,7 +515,40 @@ mod tests {
 
         // The same key from two different sources is not a duplicate.
         let vars = Vars::from_keys(pairs(&[("0005_x", "a")]), pairs(&[("5_x", "b")])).unwrap();
-        assert_eq!(vars.this(5).unwrap()["x"].value, "a");
+        assert_eq!(vars.this(5).unwrap()["x"].value.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn unset_is_a_value_like_any_other_for_precedence() {
+        // A flag wins over the environment, whichever of them unsets.
+        let vars = Vars::from_keys(unsets(&["5_x"]), pairs(&[("5_x", "a")])).unwrap();
+        let x = &vars.this(5).unwrap()["x"];
+        assert_eq!(x.value, None);
+        assert_eq!(x.describe(), "--unset 5_x");
+        let vars = Vars::from_keys(pairs(&[("5_x", "a")]), unsets(&["5_x"])).unwrap();
+        assert_eq!(vars.this(5).unwrap()["x"].value.as_deref(), Some("a"));
+        let vars = Vars::from_keys([], unsets(&["5_x"])).unwrap();
+        assert_eq!(vars.this(5).unwrap()["x"].describe(), "CHUM_UNSET_5_x");
+
+        // A value and an unset for the same key from one source conflict.
+        let mut flags = pairs(&[("5_x", "a")]);
+        flags.extend(unsets(&["0005_x"]));
+        let err = Vars::from_keys(flags, []).unwrap_err();
+        let ChumError::InvalidVarKey { key, reason } = err else {
+            panic!("expected InvalidVarKey");
+        };
+        assert_eq!(key, "--unset 0005_x");
+        assert!(reason.contains("--var 5_x"), "{reason}");
+    }
+
+    #[test]
+    fn only_this_names_can_be_unset() {
+        let err = Vars::from_keys([], unsets(&["tier"])).unwrap_err();
+        assert!(
+            matches!(err, ChumError::InvalidVarKey { ref key, ref reason }
+                if key == "CHUM_UNSET_tier" && reason.contains("version-prefixed")),
+            "{err}"
+        );
     }
 
     #[test]

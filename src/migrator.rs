@@ -6,6 +6,9 @@
 //! variable or a split error anywhere aborts the command with nothing
 //! executed and no marker written. The check covers every branch of a
 //! template, including those the supplied values don't take.
+//!
+//! Every `this.*` name a version's templates refer to must be supplied, unset
+//! or recorded before the version renders; see [`crate::vars`].
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -20,6 +23,7 @@ use crate::backend;
 use crate::backend::Bookkeeping;
 use crate::error::ChumError;
 use crate::error::RenderFailure;
+use crate::error::RenderFailureKind;
 use crate::error::Result;
 #[cfg(feature = "template")]
 use crate::error::TemplateLocation;
@@ -191,12 +195,13 @@ pub enum Progress<'a> {
     },
 }
 
-/// A supplied `this.*` value that differs from the one recorded for the
-/// version, with the namespaced name (`this.cutoff`) and the supplying key.
+/// A supplied `this.*` value or unset that differs from the value recorded
+/// for the version, with the namespaced name (`this.cutoff`) and the supplying
+/// key.
 struct Conflict {
     name: String,
     key: String,
-    supplied: String,
+    supplied: Option<String>,
     recorded: String,
 }
 
@@ -799,9 +804,30 @@ impl Migrator {
                 ));
             }
             let (env, this, conflicts) = self.effective(migration.version, recorded);
+            let required = self.required_this(migration);
+            let unsupplied: Vec<String> = required
+                .iter()
+                .filter(|name| !this.contains_key(*name))
+                .map(|name| format!("this.{name}"))
+                .collect();
+            if !unsupplied.is_empty() {
+                failures.push(
+                    RenderFailure::new(
+                        migration.version,
+                        migration.direction,
+                        "neither supplied nor unset".to_owned(),
+                        unsupplied,
+                    )
+                    .with_kind(RenderFailureKind::Unsupplied),
+                );
+                continue;
+            }
+            self.mark_used(migration.version, &required);
             match render(migration, &env, &this) {
                 Ok(r) => {
-                    if let Some(c) = conflicts.into_iter().find(|c| r.used.contains_key(&c.name)) {
+                    let read =
+                        |name: &String| r.used.contains_key(name) || r.missing.contains(name);
+                    if let Some(c) = conflicts.into_iter().find(|c| read(&c.name)) {
                         return Err(ChumError::VarConflict {
                             version: migration.version,
                             name: c.name,
@@ -827,6 +853,35 @@ impl Migrator {
             prepared.push(self.finish(migration, statements, &env, &this, r));
         }
         Ok(prepared)
+    }
+
+    /// The `this.*` names that must be supplied or unset to render
+    /// `migration`: those it refers to and, for an up migration, those its
+    /// down refers to, since an apply records the values a revert renders
+    /// with.
+    fn required_this(&self, migration: &Migration) -> BTreeSet<String> {
+        let mut names = this_names(migration);
+        if migration.direction == Direction::Up
+            && let Some(down) = self.down(migration.version)
+        {
+            names.extend(this_names(down));
+        }
+        names
+    }
+
+    /// Log the supplied `this.*` entries among `names` as used, so an unset
+    /// that a rendered migration needed isn't reported as unused.
+    fn mark_used(&self, version: i64, names: &BTreeSet<String>) {
+        let mut usage = self.usage.lock().unwrap_or_else(PoisonError::into_inner);
+        for name in names {
+            let key = VarKey::This {
+                version,
+                name: name.clone(),
+            };
+            if self.vars.get(&key).is_some() {
+                usage.used.insert(key);
+            }
+        }
     }
 
     /// Work out what a rendered migration records and uses, and log the
@@ -861,13 +916,17 @@ impl Migrator {
         {
             let refs = references(down);
             for (name, s) in env {
-                if refs.env.contains(name) {
-                    record.insert(format!("env.{name}"), s.value.clone());
+                if let Some(value) = &s.value
+                    && refs.env.contains(name)
+                {
+                    record.insert(format!("env.{name}"), value.clone());
                 }
             }
             for (name, s) in this {
-                if refs.this.contains(name) {
-                    record.insert(format!("this.{name}"), s.value.clone());
+                if let Some(value) = &s.value
+                    && refs.this.contains(name)
+                {
+                    record.insert(format!("this.{name}"), value.clone());
                 }
             }
         }
@@ -878,17 +937,25 @@ impl Migrator {
             if let Some((key, s)) = lookup(name) {
                 used.push(UsedVar {
                     name: name.clone(),
-                    value: Some(s.value.clone()),
+                    value: s.value.clone(),
                     origin: s.origin,
                 });
                 usage.used.insert(key);
             }
         }
         for name in &r.missing {
+            // An unset name reads as missing; report where the unset came from.
+            let origin = match lookup(name) {
+                Some((key, s)) => {
+                    usage.used.insert(key);
+                    s.origin
+                }
+                None => Origin::Default,
+            };
             used.push(UsedVar {
                 name: name.clone(),
                 value: None,
-                origin: Origin::Default,
+                origin,
             });
         }
         used.sort_by(|a, b| a.name.cmp(&b.name));
@@ -901,11 +968,12 @@ impl Migrator {
         }
     }
 
-    /// The `env` and `this` namespaces for `version`: the supplied values,
-    /// combined with the values recorded for the version, if any.
+    /// The `env` and `this` namespaces for `version`: the supplied values and
+    /// unsets, combined with the values recorded for the version, if any.
     ///
     /// A recorded `this.*` value describes what was applied and wins. A
-    /// different supplied value is returned as a [`Conflict`]; the caller
+    /// different supplied value, or an unset, is returned as a [`Conflict`];
+    /// the caller
     /// raises it only if the render reads that name, so a stale value for a
     /// name the migration doesn't use can't block it. A supplied `env.*` value
     /// describes the environment as it is now and wins, with a notice when it
@@ -927,24 +995,24 @@ impl Migrator {
             let from_record = || Supplied::new(value.clone(), Origin::Recorded, namespaced.clone());
             if let Some(name) = namespaced.strip_prefix("this.") {
                 if let Some(s) = this.get(name)
-                    && s.value != *value
+                    && s.value.as_ref() != Some(value)
                 {
                     conflicts.push(Conflict {
                         name: namespaced.clone(),
-                        key: s.origin.describe(&s.key),
+                        key: s.describe(),
                         supplied: s.value.clone(),
                         recorded: value.clone(),
                     });
                 }
                 this.insert(name.to_owned(), from_record());
             } else if let Some(name) = namespaced.strip_prefix("env.") {
-                match env.get(name) {
-                    Some(s) if s.value != *value => {
+                match env.get(name).and_then(|s| s.value.as_ref()) {
+                    Some(supplied) if supplied != value => {
                         self.usage
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner)
                             .env_changed
-                            .insert((version, namespaced.clone(), s.value.clone(), value.clone()));
+                            .insert((version, namespaced.clone(), supplied.clone(), value.clone()));
                     }
                     Some(_) => {}
                     None => {
@@ -1041,9 +1109,10 @@ fn render_template(
     env: &BTreeMap<String, Supplied>,
     this: &BTreeMap<String, Supplied>,
 ) -> std::result::Result<Render, RenderFailure> {
+    // An unset name is left out, so the template sees it as missing.
     let values = |m: &BTreeMap<String, Supplied>| -> BTreeMap<String, String> {
         m.iter()
-            .map(|(k, s)| (k.clone(), s.value.clone()))
+            .filter_map(|(k, s)| Some((k.clone(), s.value.clone()?)))
             .collect()
     };
     crate::template::render(
@@ -1135,6 +1204,17 @@ fn references(migration: &Migration) -> References {
     #[cfg(not(feature = "template"))]
     let _ = migration;
     References::default()
+}
+
+/// The `this.*` names a migration refers to by name. A template that reads
+/// `this` by a computed name fails [`check_all`], so its names don't matter.
+fn this_names(migration: &Migration) -> BTreeSet<String> {
+    let refs = references(migration).this;
+    if refs.all {
+        BTreeSet::new()
+    } else {
+        refs.names
+    }
 }
 
 /// The namespaced names an up template refers to, for [`Status::template_vars`].
@@ -1236,8 +1316,12 @@ mod tests {
         .vars(
             Vars::from_keys(
                 [
-                    ("1_cutoff".to_owned(), "2026-11-10".to_owned()),
-                    ("3_cutoff".to_owned(), "2026-11-10T09:00:00Z".to_owned()),
+                    ("1_cutoff".to_owned(), Some("2026-11-10".to_owned())),
+                    ("2_cutoff".to_owned(), None),
+                    (
+                        "3_cutoff".to_owned(),
+                        Some("2026-11-10T09:00:00Z".to_owned()),
+                    ),
                 ],
                 [],
             )
@@ -1278,7 +1362,10 @@ mod tests {
     #[test]
     fn up_records_what_it_used_and_what_its_down_refers_to() {
         let migrator = Migrator::new(vec![
-            up(5, "SELECT {{ env.tier }} {{ this.cutoff | default('x') }}"),
+            up(
+                5,
+                "SELECT {{ env.tier }} {{ this.cutoff | default('x') }} {{ env.x | default('y') }}",
+            ),
             down(5, "SELECT {{ this.drop_after }} {{ env.cluster }}"),
         ])
         .vars(
@@ -1286,7 +1373,8 @@ mod tests {
                 .with_env("tier", "prod")
                 .with_env("cluster", "c1")
                 .with_env("unrelated", "u")
-                .with_this(5, "drop_after", "d"),
+                .with_this(5, "drop_after", "d")
+                .with_unset(5, "cutoff"),
         );
         let p = migrator.prepare([(migrator.up(5).unwrap(), None)]).unwrap();
         assert_eq!(
@@ -1297,9 +1385,84 @@ mod tests {
                 ("this.drop_after", "d")
             ])
         );
-        let defaulted = p[0].used.iter().find(|u| u.name == "this.cutoff").unwrap();
+        let unset = p[0].used.iter().find(|u| u.name == "this.cutoff").unwrap();
+        assert_eq!(unset.value, None);
+        assert_eq!(unset.origin, Origin::Flag);
+        assert_eq!(unset.origin.label(true), "--unset");
+        let defaulted = p[0].used.iter().find(|u| u.name == "env.x").unwrap();
         assert_eq!(defaulted.value, None);
         assert_eq!(defaulted.origin, Origin::Default);
+        assert!(
+            migrator.var_notices().iter().all(|n| !matches!(
+                n,
+                VarNotice::Unused { key, .. } | VarNotice::Unreferenced { key, .. }
+                    if key.namespaced() == "this.cutoff"
+            )),
+            "the unset was needed"
+        );
+    }
+
+    #[test]
+    fn every_this_name_must_be_supplied_or_unset() {
+        let migrator = Migrator::new(vec![
+            up(
+                1,
+                "{% if this.cutoff is defined %}{{ this.cutoff }}{% endif %}\
+                 {{ this.batch | default(10) }}",
+            ),
+            down(1, "{{ this.drop | default('no') }}"),
+            up(2, "SELECT {{ this.x | default(1) }}"),
+            up(3, "SELECT 3"),
+        ]);
+        let err = migrator.render_many(&[1, 2, 3], Direction::Up).unwrap_err();
+        let ChumError::Render(failures) = &err else {
+            panic!("expected Render, got {err}");
+        };
+        assert!(
+            failures
+                .iter()
+                .all(|f| f.kind == RenderFailureKind::Unsupplied)
+        );
+        // The up must also settle what its down refers to.
+        assert_eq!(
+            failures[0].missing,
+            ["this.batch", "this.cutoff", "this.drop"]
+        );
+        assert_eq!(failures[1].missing, ["this.x"]);
+        let message = err.to_string();
+        assert!(
+            message.contains("neither supplied nor unset: `this.batch`"),
+            "{message}"
+        );
+
+        // Supplied or unset, every name is settled; the down alone needs only
+        // its own names.
+        let migrator = migrator.vars(
+            Vars::new()
+                .with_this(1, "cutoff", "T")
+                .with_unset(1, "batch")
+                .with_unset(1, "drop")
+                .with_unset(2, "x"),
+        );
+        let rendered = migrator.render_many(&[1, 2], Direction::Up).unwrap();
+        assert_eq!(
+            rendered,
+            [vec!["T10".to_owned()], vec!["SELECT 1".to_owned()]]
+        );
+        let migrator = migrator.vars(Vars::new().with_this(1, "drop", "yes"));
+        assert_eq!(migrator.render(1, Direction::Down).unwrap(), ["yes"]);
+    }
+
+    #[test]
+    fn an_unset_name_read_without_a_fallback_is_missing() {
+        let migrator =
+            Migrator::new(vec![up(1, "SELECT {{ this.x }}")]).vars(Vars::new().with_unset(1, "x"));
+        let err = migrator.render(1, Direction::Up).unwrap_err();
+        let ChumError::Render(failures) = &err else {
+            panic!("expected Render, got {err}");
+        };
+        assert_eq!(failures[0].kind, RenderFailureKind::MissingValue);
+        assert_eq!(failures[0].missing, ["this.x"]);
     }
 
     #[test]
@@ -1339,10 +1502,26 @@ mod tests {
             matches!(
                 &err,
                 ChumError::VarConflict { version: 5, name, supplied, recorded, .. }
-                    if name == "this.cutoff" && supplied == "U" && recorded == "T"
+                    if name == "this.cutoff" && supplied.as_deref() == Some("U") && recorded == "T"
             ),
             "{err}"
         );
+
+        // So is an unset.
+        let migrator = migrator.vars(
+            Vars::new()
+                .with_unset(5, "cutoff")
+                .with_this(5, "other", "o"),
+        );
+        let err = migrator
+            .prepare([(migrator.down(5).unwrap(), Some(&rec))])
+            .err()
+            .expect("conflict");
+        assert!(
+            matches!(&err, ChumError::VarConflict { supplied: None, key, .. } if key == "--unset 5_cutoff"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("as unset"), "{err}");
     }
 
     #[test]
