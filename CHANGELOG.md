@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1](https://github.com/glennib/chum/compare/v0.6.0...v0.6.1) - 2026-11-13
+
+### Other
+
+- *(deps)* update dependency cargo:cargo-nextest to v0.9.152 ([#112](https://github.com/glennib/chum/pull/112))
+
 ## [0.6.0](https://github.com/glennib/chum/compare/v0.5.0...v0.6.0) - 2026-11-13
 
 ### Added
