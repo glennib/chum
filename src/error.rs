@@ -211,8 +211,34 @@ pub enum ChumError {
     BookkeepingSchema {
         /// The fully-qualified bookkeeping table.
         table: String,
-        /// One entry per missing or mistyped column.
+        /// One entry per missing or mistyped column, or an unrecognized table
+        /// comment.
         problems: Vec<String>,
+    },
+
+    /// A newer chum declared a bookkeeping format this chum doesn't know, so
+    /// it would read or write the table wrongly.
+    #[error(
+        "bookkeeping table {table} has format {format}, but this chum only supports format \
+         {supported}"
+    )]
+    #[cfg_attr(
+        feature = "diagnostic",
+        diagnostic(
+            code(chum::bookkeeping_too_new),
+            help(
+                "A newer chum changed this table in a way older versions can't follow. Run \
+                 the chum version that last wrote to it, or a later one."
+            )
+        )
+    )]
+    BookkeepingTooNew {
+        /// The fully-qualified bookkeeping table.
+        table: String,
+        /// The format the table's comment declares.
+        format: u32,
+        /// The newest format this chum reads and writes.
+        supported: u32,
     },
 
     /// An I/O error while reading migrations or scaffolding a new one.

@@ -428,11 +428,26 @@ async fn columns(admin: &clickhouse::Client, database: &str) -> Vec<String> {
         .expect("columns")
 }
 
+/// The comment that declares the bookkeeping format this chum writes.
+const FORMAT_COMMENT: &str = "chum bookkeeping format 1";
+
+/// The bookkeeping table's comment.
+async fn comment(admin: &clickhouse::Client, database: &str) -> String {
+    admin
+        .query("SELECT comment FROM system.tables WHERE database = ? AND name = ?")
+        .bind(database)
+        .bind(TABLE)
+        .fetch_one()
+        .await
+        .expect("comment")
+}
+
 /// A bookkeeping table as any older chum release created it is read by
 /// read-only commands, which leave it alone, and gains the missing columns on
 /// the first writing command, ending with the same columns as a table this
-/// chum creates. Inserts that name only the base columns, as an older chum
-/// writes them, keep working and read as not recording unsets.
+/// chum creates, including the comment that declares its format. Inserts that
+/// name only the base columns, as an older chum writes them, keep working and
+/// read as not recording unsets.
 #[tokio::test]
 #[ignore = "requires a running ClickHouse (mise run db:up)"]
 async fn writing_commands_upgrade_a_table_from_any_older_chum() {
@@ -451,6 +466,7 @@ async fn writing_commands_upgrade_a_table_from_any_older_chum() {
         .await
         .expect("ensure table");
     let current = columns(&admin, fresh_db).await;
+    assert_eq!(comment(&admin, fresh_db).await, FORMAT_COMMENT);
     exec(&admin, &format!("DROP DATABASE IF EXISTS {fresh_db}")).await;
 
     let bookkeeping = Bookkeeping::new(bookkeeping_db, TABLE).expect("valid bookkeeping");
@@ -474,12 +490,18 @@ async fn writing_commands_upgrade_a_table_from_any_older_chum() {
             old,
             "{release}: read-only commands leave the table alone"
         );
+        assert_eq!(comment(&admin, bookkeeping_db).await, "", "{release}");
 
         migrator.run(&db, &bookkeeping, None).await.expect("run");
         assert_eq!(
             columns(&admin, bookkeeping_db).await,
             current,
             "{release}: run brought the table up to date"
+        );
+        assert_eq!(
+            comment(&admin, bookkeeping_db).await,
+            FORMAT_COMMENT,
+            "{release}"
         );
         let recorded = chum::backend::list_applied(&db, &bookkeeping)
             .await
@@ -545,6 +567,53 @@ async fn a_table_with_a_mistyped_column_is_refused() {
         "{run}"
     );
     assert_eq!(columns(&admin, bookkeeping_db).await, before);
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {bookkeeping_db}")).await;
+}
+
+/// A table a newer chum declared a newer format for is refused by reading and
+/// writing commands alike, and left as it was.
+#[tokio::test]
+#[ignore = "requires a running ClickHouse (mise run db:up)"]
+async fn a_table_in_a_newer_format_is_refused() {
+    let admin = client("default");
+    let bookkeeping_db = "chum_it_format_bk";
+    let newer = "chum bookkeeping format 2";
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {bookkeeping_db}")).await;
+    create_old_table(&admin, bookkeeping_db, "").await;
+    exec(
+        &admin,
+        &format!("ALTER TABLE {bookkeeping_db}.{TABLE} MODIFY COMMENT '{newer}'"),
+    )
+    .await;
+    let before = columns(&admin, bookkeeping_db).await;
+
+    let db = unpinned_client();
+    let bookkeeping = Bookkeeping::new(bookkeeping_db, TABLE).expect("valid bookkeeping");
+    let migrator =
+        Migrator::new(source::from_dir(&UPGRADE_MIGRATIONS).expect("embedded migrations"));
+    let info = migrator.info(&db, &bookkeeping).await.expect_err("info");
+    assert!(
+        matches!(
+            &info,
+            chum::ChumError::BookkeepingTooNew {
+                format: 2,
+                supported: 1,
+                ..
+            }
+        ),
+        "{info}"
+    );
+    let run = migrator
+        .run(&db, &bookkeeping, None)
+        .await
+        .expect_err("run");
+    assert!(
+        matches!(&run, chum::ChumError::BookkeepingTooNew { .. }),
+        "{run}"
+    );
+    assert_eq!(columns(&admin, bookkeeping_db).await, before);
+    assert_eq!(comment(&admin, bookkeeping_db).await, newer);
 
     exec(&admin, &format!("DROP DATABASE IF EXISTS {bookkeeping_db}")).await;
 }

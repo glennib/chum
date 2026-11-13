@@ -62,6 +62,11 @@
 //! unsets were recorded: it is `false` for every row an older chum wrote,
 //! before or after the upgrade, and `true` for every row this chum writes.
 //!
+//! The table's comment declares its format (`chum bookkeeping format 1`),
+//! which only changes for a change an older chum can't follow; see [`FORMAT`].
+//! The upgrade sets it on a table an older chum created. Before reading or
+//! writing, every command checks the declared format and the columns' types.
+//!
 //! # Cross-replica consistency
 //!
 //! The append-only + `argMax` design above makes a read correct regardless of
@@ -267,6 +272,22 @@ const ADDED_COLUMNS: [Column; 3] = [
     Column::new("records_unsets", "Bool").with_default("false"),
 ];
 
+/// The bookkeeping format this chum reads and writes, declared in the table's
+/// comment ([`format_comment`]).
+///
+/// Adding a column doesn't change it. Bump it only for a change an older chum
+/// would read or write wrongly: every chum after 0.5 refuses a table that
+/// declares a format newer than its own. chum 0.5 and earlier don't read the
+/// comment, so such a change must still assume they may write to the table.
+const FORMAT: u32 = 1;
+
+const FORMAT_COMMENT_PREFIX: &str = "chum bookkeeping format ";
+
+/// The table comment that declares [`FORMAT`].
+fn format_comment() -> String {
+    format!("{FORMAT_COMMENT_PREFIX}{FORMAT}")
+}
+
 /// Create the bookkeeping table if it does not already exist.
 ///
 /// Unlike user migrations (which deliberately omit `IF NOT EXISTS`), this is
@@ -285,17 +306,19 @@ pub async fn ensure_table(client: &clickhouse::Client, bookkeeping: &Bookkeeping
         .map(Column::definition)
         .collect();
     let ddl = format!(
-        "CREATE TABLE IF NOT EXISTS {} ({}) ENGINE = MergeTree ORDER BY (version, seq)",
+        "CREATE TABLE IF NOT EXISTS {} ({}) ENGINE = MergeTree ORDER BY (version, seq) \
+         COMMENT '{}'",
         bookkeeping.qualified(),
-        columns.join(", ")
+        columns.join(", "),
+        format_comment()
     );
     client.query(&ddl).execute().await?;
     Ok(())
 }
 
 /// The statement that adds every column in [`ADDED_COLUMNS`] to a bookkeeping
-/// table created by an older chum. It is idempotent, so it upgrades a table
-/// missing any subset of them.
+/// table created by an older chum and declares [`FORMAT`] in its comment. It is
+/// idempotent, so it upgrades a table missing any subset of the columns.
 #[must_use]
 pub fn upgrade_statement(bookkeeping: &Bookkeeping) -> String {
     let adds: Vec<String> = ADDED_COLUMNS
@@ -303,30 +326,75 @@ pub fn upgrade_statement(bookkeeping: &Bookkeeping) -> String {
         .map(|c| format!("ADD COLUMN IF NOT EXISTS {}", c.definition()))
         .collect();
     format!(
-        "ALTER TABLE {} {}",
+        "ALTER TABLE {} {}, MODIFY COMMENT '{}'",
         bookkeeping.qualified(),
-        adds.join(", ")
+        adds.join(", "),
+        format_comment()
     )
 }
 
-/// Check the bookkeeping table's columns and return which of
-/// [`ADDED_COLUMNS`] it has.
+/// What [`inspect`] found in a bookkeeping table that passed its checks.
+#[derive(Debug, Default)]
+struct Inspection {
+    /// Which of [`ADDED_COLUMNS`] the table has.
+    added: BTreeSet<String>,
+    /// Whether the table's comment declares a format; see [`FORMAT`].
+    marked: bool,
+}
+
+/// Check the bookkeeping table's declared format and its columns.
 ///
 /// A table that doesn't exist passes, so the query that needs it reports that.
-async fn inspect(
-    client: &clickhouse::Client,
-    bookkeeping: &Bookkeeping,
-) -> Result<BTreeSet<String>> {
+async fn inspect(client: &clickhouse::Client, bookkeeping: &Bookkeeping) -> Result<Inspection> {
+    let comment: Option<String> = client
+        .query("SELECT comment FROM system.tables WHERE database = ? AND name = ?")
+        .bind(bookkeeping.database())
+        .bind(bookkeeping.table())
+        .fetch_optional()
+        .await?;
+    let Some(comment) = comment else {
+        return Ok(Inspection::default());
+    };
+    let format = declared_format(bookkeeping, &comment)?;
+    if let Some(format) = format
+        && format > FORMAT
+    {
+        return Err(ChumError::BookkeepingTooNew {
+            table: bookkeeping.qualified(),
+            format,
+            supported: FORMAT,
+        });
+    }
     let columns: Vec<(String, String)> = client
         .query("SELECT name, type FROM system.columns WHERE database = ? AND table = ?")
         .bind(bookkeeping.database())
         .bind(bookkeeping.table())
         .fetch_all()
         .await?;
-    if columns.is_empty() {
-        return Ok(BTreeSet::new());
+    Ok(Inspection {
+        added: check_columns(bookkeeping, &columns.into_iter().collect())?,
+        marked: format.is_some(),
+    })
+}
+
+/// The format a table's comment declares, or `None` for an empty comment: a
+/// table chum 0.5 or earlier created and no later chum has written to yet.
+fn declared_format(bookkeeping: &Bookkeeping, comment: &str) -> Result<Option<u32>> {
+    if comment.is_empty() {
+        return Ok(None);
     }
-    check_columns(bookkeeping, &columns.into_iter().collect())
+    match comment
+        .strip_prefix(FORMAT_COMMENT_PREFIX)
+        .and_then(|n| n.parse().ok())
+    {
+        Some(format) => Ok(Some(format)),
+        None => Err(ChumError::BookkeepingSchema {
+            table: bookkeeping.qualified(),
+            problems: vec![format!(
+                "the table comment {comment:?} is not chum's `{FORMAT_COMMENT_PREFIX}<n>`"
+            )],
+        }),
+    }
 }
 
 /// Check `actual` (column name to type) against the columns chum knows: every
@@ -370,31 +438,33 @@ fn check_columns(
 ///
 /// # Errors
 ///
-/// Returns [`ChumError::BookkeepingSchema`] if a column is missing or
-/// mistyped, or [`ChumError::ClickHouse`] if the query fails.
+/// Returns [`ChumError::BookkeepingTooNew`] for a table a newer chum declared
+/// a newer format for, [`ChumError::BookkeepingSchema`] if a column is missing
+/// or mistyped, or [`ChumError::ClickHouse`] if the query fails.
 pub async fn has_vars_column(
     client: &clickhouse::Client,
     bookkeeping: &Bookkeeping,
 ) -> Result<bool> {
-    Ok(inspect(client, bookkeeping).await?.contains("vars"))
+    Ok(inspect(client, bookkeeping).await?.added.contains("vars"))
 }
 
 /// Whether the bookkeeping table has the `unset` column.
 ///
 /// # Errors
 ///
-/// Returns [`ChumError::BookkeepingSchema`] if a column is missing or
-/// mistyped, or [`ChumError::ClickHouse`] if the query fails.
+/// Returns [`ChumError::BookkeepingTooNew`] for a table a newer chum declared
+/// a newer format for, [`ChumError::BookkeepingSchema`] if a column is missing
+/// or mistyped, or [`ChumError::ClickHouse`] if the query fails.
 pub async fn has_unset_column(
     client: &clickhouse::Client,
     bookkeeping: &Bookkeeping,
 ) -> Result<bool> {
-    Ok(inspect(client, bookkeeping).await?.contains("unset"))
+    Ok(inspect(client, bookkeeping).await?.added.contains("unset"))
 }
 
 /// Add the columns in [`ADDED_COLUMNS`] to a bookkeeping table that lacks any
-/// of them, returning the statement that was run, or `None` when all were
-/// already there.
+/// of them and declare [`FORMAT`] in its comment, returning the statement that
+/// was run, or `None` when the table was already up to date.
 ///
 /// Only commands that write bookkeeping rows call this; read-only commands
 /// read a missing column as empty (see [`list_applied`]), so inspecting a
@@ -404,15 +474,16 @@ pub async fn has_unset_column(
 ///
 /// # Errors
 ///
-/// Returns [`ChumError::BookkeepingSchema`] if a column is missing or
-/// mistyped, [`ChumError::BookkeepingUpgrade`], carrying the statement, if the
-/// `ALTER` is refused, or [`ChumError::ClickHouse`] if the column lookup fails.
+/// Returns [`ChumError::BookkeepingTooNew`] for a table a newer chum declared
+/// a newer format for, [`ChumError::BookkeepingSchema`] if a column is missing
+/// or mistyped, [`ChumError::BookkeepingUpgrade`], carrying the statement, if
+/// the `ALTER` is refused, or [`ChumError::ClickHouse`] if the lookup fails.
 pub async fn upgrade_table(
     client: &clickhouse::Client,
     bookkeeping: &Bookkeeping,
 ) -> Result<Option<String>> {
-    let present = inspect(client, bookkeeping).await?;
-    if ADDED_COLUMNS.iter().all(|c| present.contains(c.name)) {
+    let found = inspect(client, bookkeeping).await?;
+    if found.marked && ADDED_COLUMNS.iter().all(|c| found.added.contains(c.name)) {
         return Ok(None);
     }
     let statement = upgrade_statement(bookkeeping);
@@ -440,14 +511,15 @@ pub async fn upgrade_table(
 ///
 /// # Errors
 ///
-/// Returns [`ChumError::BookkeepingSchema`] if a column is missing or
-/// mistyped, or [`ChumError::ClickHouse`] if the query fails.
+/// Returns [`ChumError::BookkeepingTooNew`] for a table a newer chum declared
+/// a newer format for, [`ChumError::BookkeepingSchema`] if a column is missing
+/// or mistyped, or [`ChumError::ClickHouse`] if the query fails.
 pub async fn list_applied(
     client: &clickhouse::Client,
     bookkeeping: &Bookkeeping,
 ) -> Result<Vec<AppliedMigration>> {
     let table = bookkeeping.qualified();
-    let present = inspect(client, bookkeeping).await?;
+    let present = inspect(client, bookkeeping).await?.added;
     let added: Vec<String> = ADDED_COLUMNS
         .iter()
         .map(|c| {
@@ -629,7 +701,10 @@ mod tests {
     use super::ADDED_COLUMNS;
     use super::BASE_COLUMNS;
     use super::Bookkeeping;
+    use super::FORMAT;
     use super::check_columns;
+    use super::declared_format;
+    use super::format_comment;
     use crate::error::ChumError;
 
     fn bk() -> Bookkeeping {
@@ -662,6 +737,26 @@ mod tests {
         // A column a newer chum added is fine.
         actual.insert("added_later".to_owned(), "String".to_owned());
         assert!(check_columns(&bk(), &actual).is_ok());
+    }
+
+    #[test]
+    fn the_comment_declares_the_format() {
+        assert_eq!(declared_format(&bk(), "").unwrap(), None);
+        assert_eq!(
+            declared_format(&bk(), &format_comment()).unwrap(),
+            Some(FORMAT)
+        );
+        assert_eq!(
+            declared_format(&bk(), "chum bookkeeping format 7").unwrap(),
+            Some(7)
+        );
+        for foreign in ["chum bookkeeping format x", "migrations"] {
+            let err = declared_format(&bk(), foreign).unwrap_err();
+            assert!(
+                matches!(&err, ChumError::BookkeepingSchema { .. }),
+                "{foreign}: {err}"
+            );
+        }
     }
 
     #[test]

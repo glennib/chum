@@ -192,6 +192,12 @@ version for code changes:
   `false` for those rows, which record values but not unsets. Add the schema
   of each release to `OLD_TABLES` in `tests/integration.rs` and to the table
   in `backend.rs`'s module docs.
+- **The table comment declares the bookkeeping format** (`backend::FORMAT`,
+  `chum bookkeeping format 1`). Every command refuses a table whose comment
+  declares a newer format. An added column never bumps it. Bump it only for a
+  change an older chum would read or write wrongly (a type change, a rename, a
+  new meaning for a column), and remember that chum 0.5 and earlier ignore
+  the comment.
 - **Statement splitting uses sqlparser's tokenizer, not a full parse** —
   ClickHouse DDL (`CREATE DICTIONARY`, `ENGINE … ORDER BY`, `AggregateFunction`,
   `JSON`) cannot be modeled as a validated AST, but statement boundaries can be

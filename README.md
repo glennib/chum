@@ -668,6 +668,13 @@ chum has written, or a column chum knows with another type, is an error
 (`chum::bookkeeping_schema`) before anything is altered or written. Columns chum
 doesn't know are allowed, since a newer chum may have added them.
 
+The table's comment declares its bookkeeping format (`chum bookkeeping format
+1`); writing commands set it on a table an older chum created. Adding columns
+doesn't change the format. A change that an older chum would read or write
+wrongly does, and chum refuses a table in a newer format than its own
+(`chum::bookkeeping_too_new`) instead of misreading it. chum 0.5 and earlier
+don't read the comment.
+
 `chum` does **not** adopt databases previously migrated by another tool — an
 already-migrated database must be handled manually (e.g. `chum force` each
 version, or start from a fresh database).
