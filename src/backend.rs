@@ -163,7 +163,8 @@ fn validate_ident(ident: &str, kind: &str) -> Result<()> {
     }
 }
 
-/// Row shape read back from the bookkeeping table.
+/// Row shape read back from the bookkeeping table. Fields are read by
+/// position, so the [`ADDED_COLUMNS`] come last, in their order.
 #[derive(Debug, clickhouse::Row, serde::Deserialize)]
 struct AppliedRow {
     version: i64,
@@ -196,54 +197,115 @@ pub async fn ensure_database(client: &clickhouse::Client, bookkeeping: &Bookkeep
     Ok(())
 }
 
+/// A column of the bookkeeping table.
+struct Column {
+    name: &'static str,
+    /// The type, spelled as `system.columns` reports it.
+    ty: &'static str,
+    /// The `DEFAULT` expression, if the column has one.
+    default: Option<&'static str>,
+}
+
+impl Column {
+    const fn new(name: &'static str, ty: &'static str) -> Self {
+        Self {
+            name,
+            ty,
+            default: None,
+        }
+    }
+
+    const fn with_default(self, default: &'static str) -> Self {
+        Self {
+            default: Some(default),
+            ..self
+        }
+    }
+
+    /// The column's definition in `CREATE TABLE` and `ADD COLUMN`.
+    fn definition(&self) -> String {
+        match self.default {
+            Some(default) => format!("{} {} DEFAULT {default}", self.name, self.ty),
+            None => format!("{} {}", self.name, self.ty),
+        }
+    }
+
+    /// What a row reads for the column in a table that lacks it: the value an
+    /// older chum's inserts get once the column is added, so a row reads the
+    /// same before and after the upgrade.
+    fn missing_value(&self) -> String {
+        match self.default {
+            Some(default) => format!("CAST({default}, '{}')", self.ty),
+            None => format!("defaultValueOfTypeName('{}')", self.ty),
+        }
+    }
+}
+
+/// The columns of the table chum 0.1.0 created, which every bookkeeping table
+/// has.
+const BASE_COLUMNS: [Column; 7] = [
+    Column::new("version", "Int64"),
+    Column::new("description", "String"),
+    Column::new("checksum", "String"),
+    Column::new("execution_ms", "UInt64"),
+    Column::new("success", "Bool"),
+    Column::new("applied_at", "DateTime64(3, 'UTC')").with_default("now64(3)"),
+    Column::new("seq", "UInt64"),
+];
+
+/// The columns added since chum 0.1.0, oldest first: `vars` (the recorded
+/// variable values), `unset` (the `this.*` names a version was applied
+/// without) and `records_unsets` (whether the row fills `unset`).
+///
+/// A new column goes at the end, with a `DEFAULT` that is right for the rows an
+/// older chum keeps writing without it, and in [`AppliedRow`] at the same
+/// position. [`ensure_table`], [`upgrade_statement`] and [`list_applied`]
+/// follow from this list.
+const ADDED_COLUMNS: [Column; 3] = [
+    Column::new("vars", "Map(String, String)"),
+    Column::new("unset", "Array(String)"),
+    Column::new("records_unsets", "Bool").with_default("false"),
+];
+
 /// Create the bookkeeping table if it does not already exist.
 ///
 /// Unlike user migrations (which deliberately omit `IF NOT EXISTS`), this is
 /// chum's internal table and is created idempotently on every run. The table is
 /// fully-qualified to the bookkeeping database, so [`ensure_database`] must run
-/// first.
+/// first. A table an older chum created is left as it was; see
+/// [`upgrade_table`].
 ///
 /// # Errors
 ///
 /// Returns [`ChumError::ClickHouse`] if the DDL fails.
 pub async fn ensure_table(client: &clickhouse::Client, bookkeeping: &Bookkeeping) -> Result<()> {
-    let table = bookkeeping.qualified();
+    let columns: Vec<String> = BASE_COLUMNS
+        .iter()
+        .chain(&ADDED_COLUMNS)
+        .map(Column::definition)
+        .collect();
     let ddl = format!(
-        "CREATE TABLE IF NOT EXISTS {table}
-         (
-             version      Int64,
-             description  String,
-             checksum     String,
-             execution_ms UInt64,
-             success      Bool,
-             applied_at   DateTime64(3, 'UTC') DEFAULT now64(3),
-             seq          UInt64,
-             vars         Map(String, String),
-             unset        Array(String),
-             records_unsets Bool DEFAULT false
-         )
-         ENGINE = MergeTree
-         ORDER BY (version, seq)"
+        "CREATE TABLE IF NOT EXISTS {} ({}) ENGINE = MergeTree ORDER BY (version, seq)",
+        bookkeeping.qualified(),
+        columns.join(", ")
     );
     client.query(&ddl).execute().await?;
     Ok(())
 }
-
-/// The columns added after the bookkeeping table's first release: `vars`
-/// (the recorded variable values), `unset` (the `this.*` names a version was
-/// applied without) and `records_unsets` (whether the row fills `unset`).
-const ADDED_COLUMNS: [&str; 3] = ["vars", "unset", "records_unsets"];
 
 /// The statement that adds every column in [`ADDED_COLUMNS`] to a bookkeeping
 /// table created by an older chum. It is idempotent, so it upgrades a table
 /// missing any subset of them.
 #[must_use]
 pub fn upgrade_statement(bookkeeping: &Bookkeeping) -> String {
+    let adds: Vec<String> = ADDED_COLUMNS
+        .iter()
+        .map(|c| format!("ADD COLUMN IF NOT EXISTS {}", c.definition()))
+        .collect();
     format!(
-        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS vars Map(String, String), \
-         ADD COLUMN IF NOT EXISTS unset Array(String), \
-         ADD COLUMN IF NOT EXISTS records_unsets Bool DEFAULT false",
-        bookkeeping.qualified()
+        "ALTER TABLE {} {}",
+        bookkeeping.qualified(),
+        adds.join(", ")
     )
 }
 
@@ -259,7 +321,7 @@ async fn added_columns(
         )
         .bind(bookkeeping.database())
         .bind(bookkeeping.table())
-        .bind(ADDED_COLUMNS)
+        .bind(ADDED_COLUMNS.map(|c| c.name))
         .fetch_all()
         .await?;
     Ok(names.into_iter().collect())
@@ -308,7 +370,7 @@ pub async fn upgrade_table(
     bookkeeping: &Bookkeeping,
 ) -> Result<Option<String>> {
     let present = added_columns(client, bookkeeping).await?;
-    if ADDED_COLUMNS.iter().all(|c| present.contains(*c)) {
+    if ADDED_COLUMNS.iter().all(|c| present.contains(c.name)) {
         return Ok(None);
     }
     let statement = upgrade_statement(bookkeeping);
@@ -343,21 +405,18 @@ pub async fn list_applied(
 ) -> Result<Vec<AppliedMigration>> {
     let table = bookkeeping.qualified();
     let present = added_columns(client, bookkeeping).await?;
-    let vars = if present.contains("vars") {
-        "argMax(vars, seq)"
-    } else {
-        "CAST(map(), 'Map(String, String)')"
-    };
-    let unset = if present.contains("unset") {
-        "argMax(unset, seq)"
-    } else {
-        "CAST([], 'Array(String)')"
-    };
-    let records_unsets = if present.contains("records_unsets") {
-        "argMax(records_unsets, seq)"
-    } else {
-        "false"
-    };
+    let added: Vec<String> = ADDED_COLUMNS
+        .iter()
+        .map(|c| {
+            let value = if present.contains(c.name) {
+                format!("argMax({}, seq)", c.name)
+            } else {
+                c.missing_value()
+            };
+            format!("{value} AS {}", c.name)
+        })
+        .collect();
+    let added = added.join(",\n                ");
     // `bk.success` names the column: a bare `success` inside `max` resolves to
     // the `argMax` alias, which ClickHouse rejects as a nested aggregate.
     let sql = format!(
@@ -368,9 +427,7 @@ pub async fn list_applied(
                 argMax(applied_at, seq)   AS applied_at,
                 argMax(success, seq)      AS success,
                 max(bk.success)           AS succeeded_before,
-                {vars}                    AS vars,
-                {unset}                   AS unset,
-                {records_unsets}          AS records_unsets
+                {added}
          FROM {table} AS bk
          GROUP BY version
          ORDER BY version"

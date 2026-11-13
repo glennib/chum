@@ -179,14 +179,15 @@ version for code changes:
   render from.
 - **The bookkeeping schema only ever gains columns, and every older schema
   must keep working.** `ensure_table` creates the current schema, but `CREATE
-  TABLE IF NOT EXISTS` leaves an older table as it was, so a new column also
-  goes into `backend::ADDED_COLUMNS` and `upgrade_statement` (an idempotent
-  `ADD COLUMN IF NOT EXISTS`), which only writing commands run; read-only
-  commands must read a missing column as its default without altering the
-  table (see `list_applied`). Give the column a `DEFAULT` that is correct for
-  rows an older chum writes, since it keeps writing to the upgraded table and
-  names only its own columns. That is why `records_unsets` exists: it is
-  `false` for those rows, which record values but not unsets. Add the schema of
+  TABLE IF NOT EXISTS` leaves an older table as it was. A new column is
+  appended to `backend::ADDED_COLUMNS` (and to `AppliedRow`, at the same
+  position); the `CREATE TABLE`, the idempotent `ADD COLUMN IF NOT EXISTS`
+  upgrade that only writing commands run, and the value read-only commands
+  read for a missing column without altering the table all come from that
+  list. Give the column a `DEFAULT` that is correct for rows an older chum
+  writes, since it keeps writing to the upgraded table and names only its own
+  columns. That is why `records_unsets` exists: it is `false` for those rows,
+  which record values but not unsets. Add the schema of
   each release to `OLD_TABLES` in `tests/integration.rs` and to the table in
   `backend.rs`'s module docs.
 - **Statement splitting uses sqlparser's tokenizer, not a full parse** —
