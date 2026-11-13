@@ -184,12 +184,14 @@ version for code changes:
   position); the `CREATE TABLE`, the idempotent `ADD COLUMN IF NOT EXISTS`
   upgrade that only writing commands run, and the value read-only commands
   read for a missing column without altering the table all come from that
-  list. Give the column a `DEFAULT` that is correct for rows an older chum
-  writes, since it keeps writing to the upgraded table and names only its own
-  columns. That is why `records_unsets` exists: it is `false` for those rows,
-  which record values but not unsets. Add the schema of
-  each release to `OLD_TABLES` in `tests/integration.rs` and to the table in
-  `backend.rs`'s module docs.
+  list, as does the check every command runs on the table's columns (spell a
+  type exactly as `system.columns` reports it, or the check rejects the
+  table chum just created). Give the column a `DEFAULT` that is correct for
+  rows an older chum writes, since it keeps writing to the upgraded table and
+  names only its own columns. That is why `records_unsets` exists: it is
+  `false` for those rows, which record values but not unsets. Add the schema
+  of each release to `OLD_TABLES` in `tests/integration.rs` and to the table
+  in `backend.rs`'s module docs.
 - **Statement splitting uses sqlparser's tokenizer, not a full parse** —
   ClickHouse DDL (`CREATE DICTIONARY`, `ENGINE … ORDER BY`, `AggregateFunction`,
   `JSON`) cannot be modeled as a validated AST, but statement boundaries can be

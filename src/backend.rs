@@ -309,46 +309,87 @@ pub fn upgrade_statement(bookkeeping: &Bookkeeping) -> String {
     )
 }
 
-/// Which of [`ADDED_COLUMNS`] the bookkeeping table has.
-async fn added_columns(
+/// Check the bookkeeping table's columns and return which of
+/// [`ADDED_COLUMNS`] it has.
+///
+/// A table that doesn't exist passes, so the query that needs it reports that.
+async fn inspect(
     client: &clickhouse::Client,
     bookkeeping: &Bookkeeping,
 ) -> Result<BTreeSet<String>> {
-    let names: Vec<String> = client
-        .query(
-            "SELECT name FROM system.columns \
-             WHERE database = ? AND table = ? AND name IN ?",
-        )
+    let columns: Vec<(String, String)> = client
+        .query("SELECT name, type FROM system.columns WHERE database = ? AND table = ?")
         .bind(bookkeeping.database())
         .bind(bookkeeping.table())
-        .bind(ADDED_COLUMNS.map(|c| c.name))
         .fetch_all()
         .await?;
-    Ok(names.into_iter().collect())
+    if columns.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    check_columns(bookkeeping, &columns.into_iter().collect())
+}
+
+/// Check `actual` (column name to type) against the columns chum knows: every
+/// one of [`BASE_COLUMNS`] must be there, and each known column must have its
+/// type. Other columns are allowed, since a newer chum may have added them.
+/// Returns which of [`ADDED_COLUMNS`] the table has.
+fn check_columns(
+    bookkeeping: &Bookkeeping,
+    actual: &BTreeMap<String, String>,
+) -> Result<BTreeSet<String>> {
+    let mut problems = Vec::new();
+    for column in &BASE_COLUMNS {
+        if !actual.contains_key(column.name) {
+            problems.push(format!("column `{}` is missing", column.name));
+        }
+    }
+    for column in BASE_COLUMNS.iter().chain(&ADDED_COLUMNS) {
+        if let Some(ty) = actual.get(column.name)
+            && ty != column.ty
+        {
+            problems.push(format!(
+                "column `{}` is `{ty}`, expected `{}`",
+                column.name, column.ty
+            ));
+        }
+    }
+    if !problems.is_empty() {
+        return Err(ChumError::BookkeepingSchema {
+            table: bookkeeping.qualified(),
+            problems,
+        });
+    }
+    Ok(ADDED_COLUMNS
+        .iter()
+        .filter(|c| actual.contains_key(c.name))
+        .map(|c| c.name.to_owned())
+        .collect())
 }
 
 /// Whether the bookkeeping table has the `vars` column.
 ///
 /// # Errors
 ///
-/// Returns [`ChumError::ClickHouse`] if the query fails.
+/// Returns [`ChumError::BookkeepingSchema`] if a column is missing or
+/// mistyped, or [`ChumError::ClickHouse`] if the query fails.
 pub async fn has_vars_column(
     client: &clickhouse::Client,
     bookkeeping: &Bookkeeping,
 ) -> Result<bool> {
-    Ok(added_columns(client, bookkeeping).await?.contains("vars"))
+    Ok(inspect(client, bookkeeping).await?.contains("vars"))
 }
 
 /// Whether the bookkeeping table has the `unset` column.
 ///
 /// # Errors
 ///
-/// Returns [`ChumError::ClickHouse`] if the query fails.
+/// Returns [`ChumError::BookkeepingSchema`] if a column is missing or
+/// mistyped, or [`ChumError::ClickHouse`] if the query fails.
 pub async fn has_unset_column(
     client: &clickhouse::Client,
     bookkeeping: &Bookkeeping,
 ) -> Result<bool> {
-    Ok(added_columns(client, bookkeeping).await?.contains("unset"))
+    Ok(inspect(client, bookkeeping).await?.contains("unset"))
 }
 
 /// Add the columns in [`ADDED_COLUMNS`] to a bookkeeping table that lacks any
@@ -363,13 +404,14 @@ pub async fn has_unset_column(
 ///
 /// # Errors
 ///
-/// Returns [`ChumError::BookkeepingUpgrade`], carrying the statement, if the
+/// Returns [`ChumError::BookkeepingSchema`] if a column is missing or
+/// mistyped, [`ChumError::BookkeepingUpgrade`], carrying the statement, if the
 /// `ALTER` is refused, or [`ChumError::ClickHouse`] if the column lookup fails.
 pub async fn upgrade_table(
     client: &clickhouse::Client,
     bookkeeping: &Bookkeeping,
 ) -> Result<Option<String>> {
-    let present = added_columns(client, bookkeeping).await?;
+    let present = inspect(client, bookkeeping).await?;
     if ADDED_COLUMNS.iter().all(|c| present.contains(c.name)) {
         return Ok(None);
     }
@@ -398,13 +440,14 @@ pub async fn upgrade_table(
 ///
 /// # Errors
 ///
-/// Returns [`ChumError::ClickHouse`] if the query fails.
+/// Returns [`ChumError::BookkeepingSchema`] if a column is missing or
+/// mistyped, or [`ChumError::ClickHouse`] if the query fails.
 pub async fn list_applied(
     client: &clickhouse::Client,
     bookkeeping: &Bookkeeping,
 ) -> Result<Vec<AppliedMigration>> {
     let table = bookkeeping.qualified();
-    let present = added_columns(client, bookkeeping).await?;
+    let present = inspect(client, bookkeeping).await?;
     let added: Vec<String> = ADDED_COLUMNS
         .iter()
         .map(|c| {
@@ -581,7 +624,65 @@ pub async fn delete_version(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use super::ADDED_COLUMNS;
+    use super::BASE_COLUMNS;
     use super::Bookkeeping;
+    use super::check_columns;
+    use crate::error::ChumError;
+
+    fn bk() -> Bookkeeping {
+        Bookkeeping::new("_chum", "_chum_migrations").expect("valid identifiers")
+    }
+
+    fn table(columns: &[&super::Column]) -> BTreeMap<String, String> {
+        columns
+            .iter()
+            .map(|c| (c.name.to_owned(), c.ty.to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn every_schema_an_older_chum_created_passes() {
+        let base: Vec<_> = BASE_COLUMNS.iter().collect();
+        assert!(check_columns(&bk(), &table(&base)).unwrap().is_empty());
+
+        let with_vars: Vec<_> = BASE_COLUMNS.iter().chain(&ADDED_COLUMNS[..1]).collect();
+        let present = check_columns(&bk(), &table(&with_vars)).unwrap();
+        assert_eq!(present.into_iter().collect::<Vec<_>>(), ["vars"]);
+
+        let current: Vec<_> = BASE_COLUMNS.iter().chain(&ADDED_COLUMNS).collect();
+        let mut actual = table(&current);
+        assert_eq!(
+            check_columns(&bk(), &actual).unwrap().len(),
+            ADDED_COLUMNS.len()
+        );
+
+        // A column a newer chum added is fine.
+        actual.insert("added_later".to_owned(), "String".to_owned());
+        assert!(check_columns(&bk(), &actual).is_ok());
+    }
+
+    #[test]
+    fn missing_base_columns_and_wrong_types_are_reported_together() {
+        let current: Vec<_> = BASE_COLUMNS.iter().chain(&ADDED_COLUMNS).collect();
+        let mut actual = table(&current);
+        actual.remove("seq");
+        actual.insert("unset".to_owned(), "String".to_owned());
+        let err = check_columns(&bk(), &actual).unwrap_err();
+        let ChumError::BookkeepingSchema { table, problems } = &err else {
+            panic!("expected BookkeepingSchema, got {err}");
+        };
+        assert_eq!(table, "_chum._chum_migrations");
+        assert_eq!(
+            problems,
+            &[
+                "column `seq` is missing",
+                "column `unset` is `String`, expected `Array(String)`",
+            ]
+        );
+    }
 
     #[test]
     fn bookkeeping_new_accepts_bare_identifiers_and_qualifies() {

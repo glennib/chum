@@ -663,6 +663,11 @@ version applied by an older chum therefore records only values: `revert` and
 `force` read a `this.*` name its templates refer to but its marker lacks as
 unset, since that chum was given no value for it.
 
+Every command checks the table's columns first. A missing column that every
+chum has written, or a column chum knows with another type, is an error
+(`chum::bookkeeping_schema`) before anything is altered or written. Columns chum
+doesn't know are allowed, since a newer chum may have added them.
+
 `chum` does **not** adopt databases previously migrated by another tool — an
 already-migrated database must be handled manually (e.g. `chum force` each
 version, or start from a fresh database).

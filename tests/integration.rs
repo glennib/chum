@@ -515,6 +515,40 @@ async fn writing_commands_upgrade_a_table_from_any_older_chum() {
     exec(&admin, &format!("DROP DATABASE IF EXISTS {bookkeeping_db}")).await;
 }
 
+/// A column chum knows with a type it doesn't expect is refused by reading
+/// and writing commands alike, before the table is altered.
+#[tokio::test]
+#[ignore = "requires a running ClickHouse (mise run db:up)"]
+async fn a_table_with_a_mistyped_column_is_refused() {
+    let admin = client("default");
+    let bookkeeping_db = "chum_it_schema_bk";
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {bookkeeping_db}")).await;
+    create_old_table(&admin, bookkeeping_db, ", unset String").await;
+    let before = columns(&admin, bookkeeping_db).await;
+
+    let db = unpinned_client();
+    let bookkeeping = Bookkeeping::new(bookkeeping_db, TABLE).expect("valid bookkeeping");
+    let migrator =
+        Migrator::new(source::from_dir(&UPGRADE_MIGRATIONS).expect("embedded migrations"));
+    let expected = ["column `unset` is `String`, expected `Array(String)`"];
+    let info = migrator.info(&db, &bookkeeping).await.expect_err("info");
+    assert!(
+        matches!(&info, chum::ChumError::BookkeepingSchema { problems, .. } if problems == &expected),
+        "{info}"
+    );
+    let run = migrator
+        .run(&db, &bookkeeping, None)
+        .await
+        .expect_err("run");
+    assert!(
+        matches!(&run, chum::ChumError::BookkeepingSchema { .. }),
+        "{run}"
+    );
+    assert_eq!(columns(&admin, bookkeeping_db).await, before);
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {bookkeeping_db}")).await;
+}
+
 /// chum 0.5 recorded only the values a version used, so a version it applied
 /// without an optional `this.*` value has no record of that name. After the
 /// upgrade, revert reads the name as unset and needs nothing supplied, as

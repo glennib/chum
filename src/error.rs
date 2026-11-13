@@ -194,6 +194,27 @@ pub enum ChumError {
         source: clickhouse::error::Error,
     },
 
+    /// The bookkeeping table lacks a column every chum has written, or has a
+    /// column chum knows with a different type.
+    #[error("bookkeeping table {table} has an unexpected schema: {}", problems.join("; "))]
+    #[cfg_attr(
+        feature = "diagnostic",
+        diagnostic(
+            code(chum::bookkeeping_schema),
+            help(
+                "Check that `--bookkeeping-database` and `--table` name a table chum created, \
+                 and that nothing altered its columns. Columns chum adds over time are not a \
+                 problem: writing commands add any that are missing."
+            )
+        )
+    )]
+    BookkeepingSchema {
+        /// The fully-qualified bookkeeping table.
+        table: String,
+        /// One entry per missing or mistyped column.
+        problems: Vec<String>,
+    },
+
     /// An I/O error while reading migrations or scaffolding a new one.
     #[error("I/O error")]
     #[cfg_attr(
