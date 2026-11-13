@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/glennib/chum/compare/v0.5.0...v0.6.0) - 2026-11-13
+
+### Added
+
+- *(bookkeeping)* declare the bookkeeping format in the table comment
+- *(bookkeeping)* refuse a bookkeeping table with missing or mistyped columns
+- *(cli)* add `--missing-this unset` for databases built from scratch
+- *(bookkeeping)* [**breaking**] record the `this.*` names a version was unset for
+- *(vars)* [**breaking**] require every `this.*` name to be supplied or unset
+
+### Fixed
+
+- *(bookkeeping)* read names an older chum didn't record as unset
+- *(deps)* update rust crate sqlparser to 0.64 ([#110](https://github.com/glennib/chum/pull/110))
+
+### Other
+
+- *(bookkeeping)* derive the table's DDL, upgrade and reads from one column list
+- *(claude)* sync CLAUDE.md with templating and bookkeeping upgrades
+- *(deps)* update dependency cargo-binstall to v1.27.0 ([#111](https://github.com/glennib/chum/pull/111))
+
 ## [0.5.0](https://github.com/glennib/chum/compare/v0.4.1...v0.5.0) - 2026-11-08
 
 ### Fixed
