@@ -17,17 +17,20 @@ manual and the rationale.
   db:up` (compose publishes it on host port **8124**, not 8123, to avoid
   colliding with another project's ClickHouse), then `cargo nextest run
   --run-ignored all` (the tests default `CLICKHOUSE_URL` to
-  `http://localhost:8124`). They embed `tests/migrations/`,
-  `tests/bootstrap_migrations/`, `tests/bootstrap_migrations_override/`, and
-  `tests/question_mark_migrations/` and cover: the full apply → re-run → info →
-  revert cycle with bookkeeping in a dedicated database; a migration that
-  creates its **own** database with the app db not pre-existing; the
-  `--bookkeeping-database` override; and `?` / `??` in migration SQL reaching
-  ClickHouse verbatim.
+  `http://localhost:8124`). They embed the fixture directories under `tests/`
+  and cover: the full apply → re-run → info → revert cycle with bookkeeping in
+  a dedicated database; a migration that creates its **own** database with the
+  app db not pre-existing; the `--bookkeeping-database` override; `?` / `??` in
+  migration SQL reaching ClickHouse verbatim; templated migrations recording
+  their variables and unsets and reverting from them; dirty versions after a
+  failed statement; and upgrading a bookkeeping table from every schema an
+  older chum release created.
 - **Final pre-commit check**: `mise run ci` — runs `fmt:check`, `clippy`,
-  `clippy:lib`, `test`, `build:debug`, and `build:lib`. Run it after
-  implementing changes and before committing; a green `mise run ci` is the bar
-  for trusting any change.
+  `clippy:lib`, `clippy:lib:template`, `test`, `build:debug`, `build:lib`, and
+  `build:lib:template`. Run it after implementing changes and before
+  committing; a green `mise run ci` is the bar for trusting any change. It
+  skips the end-to-end tests, so run those too when a change touches
+  bookkeeping or anything else that talks to ClickHouse.
 
 ## Library / CLI split
 
@@ -42,13 +45,17 @@ The crate is split by the `cli` feature (on by default):
   CLI-only deps leak into the library. The opt-in `diagnostic` feature adds a
   `miette::Diagnostic` derive (error codes + `help` text) on `ChumError`,
   pulling in `miette` (no `fancy`); it is **off** in the no-default-features
-  build, so the contract above is unchanged.
+  build, so the contract above is unchanged. The opt-in `template` feature
+  adds `minijinja` to render `.sql.j2` / `.j2.sql` migrations; without it a
+  source containing a template fails to load. `mise run build:lib:template` /
+  `clippy:lib:template` guard the library with only that feature.
 - **CLI** (`src/bin/chum.rs`, `required-features = ["cli"]`) — owns the
   connection story (URL/DSN → `clickhouse::Client`), presentation, and the
-  interactive prompts. The binary uses `miette` for error reporting (the `cli`
-  feature enables `diagnostic` + `miette/fancy`, so the library's per-variant
-  codes and `help` survive `?` and render in the graphical report); the library
-  itself never reports, only returns `ChumError`.
+  interactive prompts. The `cli` feature enables `template`. The binary uses
+  `miette` for error reporting (the `cli` feature enables `diagnostic` +
+  `miette/fancy`, so the library's per-variant codes and `help` survive `?` and
+  render in the graphical report); the library itself never reports, only
+  returns `ChumError`.
 
 ## CLI flags and env vars travel together
 
@@ -68,7 +75,10 @@ flags every subcommand uses (`OutputArgs`) are `global = true`, so they go
 before or after the subcommand; all others go after it.
 
 There is no separate config file: clap is the single source of truth for
-defaults and env-var mapping.
+defaults and env-var mapping. The exception is the prefixed variables
+`CHUM_VAR_<key>` and `CHUM_UNSET_<key>`, which clap can't express: `VarArgs`
+reads them from the environment by hand (`env_vars`), and the README's flag
+table lists them beside `--var` / `--unset`.
 
 ## Architecture
 
@@ -79,12 +89,18 @@ src/
 ├── migration.rs  # Migration, AppliedMigration, Direction, checksums
 ├── source.rs     # Migration sources: from_dir (embedded) / from_path (runtime), filename parsing
 ├── split.rs      # Statement splitter (sqlparser tokenizer → boundaries, not a full AST)
-├── backend.rs    # ClickHouse bookkeeping: the `Bookkeeping` target (dedicated db + table), append-only inserts, argMax reads
+├── template.rs   # minijinja rendering and checking of templated migrations (`template` feature)
+├── vars.rs       # Vars: `env.*` / `this.*` values and unsets, their origins, MissingThis
+├── backend.rs    # ClickHouse bookkeeping: the `Bookkeeping` target (dedicated db + table), schema upgrades, append-only inserts, argMax reads
 ├── error.rs      # ChumError (thiserror) + Result alias
 └── bin/chum.rs   # CLI: URL/DSN → client, subcommands, table/TSV/JSON output
 tests/
-├── integration.rs   # e2e lifecycle test (#[ignore]d) + filename-scan unit test
-└── migrations/      # generic fixture schema embedded by the e2e test
+├── integration.rs                     # e2e tests (#[ignore]d) + filename-scan unit test
+├── migrations/                        # generic fixture schema with tricky ClickHouse DDL
+├── bootstrap_migrations{,_override}/  # migrations that create their own database
+├── question_mark_migrations/          # `?` / `??` that must reach ClickHouse verbatim
+├── template_migrations/               # templated fixtures using `env.*` and `this.*`
+└── upgrade_migrations/                # run against bookkeeping tables in older schemas
 ```
 
 ## Conventions
@@ -150,21 +166,39 @@ version for code changes:
   possibly-missing app db and break the create-your-own-db flow. The database
   resolution in `build_client` is `cli.database.or(path_database).or(database_q)`
   — `cli.database` (and `cli.user`/`cli.password`/`cli.url`) are populated only
-  from the CLI. **Only `CHUM_TABLE` / `CHUM_BOOKKEEPING_DATABASE` (`CHUM_*` tool
-  config) stay env-readable.**
+  from the CLI. **Only `CHUM_*` tool config stays env-readable** (`CHUM_TABLE`,
+  `CHUM_BOOKKEEPING_DATABASE`, `CHUM_SOURCE`, `CHUM_STRICT_CONSISTENCY`,
+  `CHUM_MISSING_THIS`, `CHUM_VAR_*`, `CHUM_UNSET_*`).
 - **Bookkeeping engine is `MergeTree`** so one DDL works on both single-node and
   `Replicated` ClickHouse (auto-promoted to `ReplicatedMergeTree`).
 - **Append-only state** — each apply writes a `success = false` marker, runs the
   statements, then a `success = true` marker. Latest state per version is read
-  with `argMax(col, seq)`; a stuck `false` reads as **dirty**.
+  with `argMax(col, seq)`; a stuck `false` reads as **dirty**. Each marker
+  also records the template variables the version used (`vars`) and the
+  `this.*` names it was applied without (`unset`), which `revert` and `force`
+  render from.
+- **The bookkeeping schema only ever gains columns, and every older schema
+  must keep working.** `ensure_table` creates the current schema, but `CREATE
+  TABLE IF NOT EXISTS` leaves an older table as it was, so a new column also
+  goes into `backend::ADDED_COLUMNS` and `upgrade_statement` (an idempotent
+  `ADD COLUMN IF NOT EXISTS`), which only writing commands run; read-only
+  commands must read a missing column as its default without altering the
+  table (see `list_applied`). Give the column a `DEFAULT` that is correct for
+  rows an older chum writes, since it keeps writing to the upgraded table and
+  names only its own columns. That is why `records_unsets` exists: it is
+  `false` for those rows, which record values but not unsets. Add the schema of
+  each release to `OLD_TABLES` in `tests/integration.rs` and to the table in
+  `backend.rs`'s module docs.
 - **Statement splitting uses sqlparser's tokenizer, not a full parse** —
   ClickHouse DDL (`CREATE DICTIONARY`, `ENGINE … ORDER BY`, `AggregateFunction`,
   `JSON`) cannot be modeled as a validated AST, but statement boundaries can be
   found robustly. The splitter slices the original SQL verbatim between
   boundaries. `tests/migrations/` deliberately includes this tricky DDL.
-- **Cross-replica consistency** is achieved with a client-wide bundle of session
+- **Cross-replica consistency** comes from a client-wide bundle of session
   settings (quorum + sequential consistency, sync deletes, no async insert), not
-  table-DDL or cluster config.
+  table-DDL or cluster config. It is **opt-in** (`--strict-consistency` /
+  `CHUM_STRICT_CONSISTENCY`) because its `insert_quorum` settings hung every
+  bookkeeping `INSERT` against an Aiven cluster.
 
 ## Distribution
 
