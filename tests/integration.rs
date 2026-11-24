@@ -20,6 +20,8 @@
 //! the default below matches.
 
 use chum::Bookkeeping;
+use chum::Direction;
+use chum::Migration;
 use chum::Migrator;
 use chum::State;
 use chum::source;
@@ -342,6 +344,55 @@ async fn bookkeeping_database_override_is_honored() {
         .expect("undo");
     exec(&admin, &format!("DROP DATABASE IF EXISTS {override_db}")).await;
     exec(&admin, &format!("DROP DATABASE IF EXISTS {app_db}")).await;
+}
+
+/// A user granted everything on a pre-created database except `CREATE
+/// DATABASE` can keep its bookkeeping there, connected with that database as
+/// the session default. ClickHouse checks the grant even for `CREATE DATABASE
+/// IF NOT EXISTS` on an existing database, so chum must not issue it.
+///
+/// Needs access management for the `default` user (set in `compose.yaml`).
+#[tokio::test]
+#[ignore = "requires a running ClickHouse (mise run db:up)"]
+async fn a_pre_created_database_needs_no_create_database_grant() {
+    let admin = client("default");
+    let db_name = "chum_it_least_privilege";
+    let user = "chum_it_least_privilege";
+
+    exec(&admin, &format!("DROP USER IF EXISTS {user}")).await;
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {db_name}")).await;
+    exec(&admin, &format!("CREATE DATABASE {db_name}")).await;
+    exec(
+        &admin,
+        &format!("CREATE USER {user} IDENTIFIED WITH no_password"),
+    )
+    .await;
+    exec(&admin, &format!("GRANT ALL ON {db_name}.* TO {user}")).await;
+    exec(
+        &admin,
+        &format!("REVOKE CREATE DATABASE ON {db_name}.* FROM {user}"),
+    )
+    .await;
+    exec(
+        &admin,
+        &format!("GRANT TABLE ENGINE ON MergeTree TO {user}"),
+    )
+    .await;
+
+    let db = client(db_name).with_user(user);
+    let bookkeeping = Bookkeeping::new(db_name, TABLE).expect("valid bookkeeping");
+    let migrator = Migrator::new(vec![Migration::new(
+        1,
+        "create t",
+        Direction::Up,
+        "CREATE TABLE t (x UInt8) ENGINE = MergeTree ORDER BY x",
+    )]);
+
+    migrator.run(&db, &bookkeeping, None).await.expect("run");
+    assert_eq!(table_count(&admin, db_name).await, 2, "t and bookkeeping");
+
+    exec(&admin, &format!("DROP USER IF EXISTS {user}")).await;
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {db_name}")).await;
 }
 
 /// Migration SQL reaches ClickHouse verbatim: a `?` in a string literal or a

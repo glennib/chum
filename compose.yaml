@@ -14,6 +14,9 @@
 services:
   clickhouse:
     image: docker.io/clickhouse/clickhouse-server:26.10
+    environment:
+      # Lets the tests create a user with limited grants.
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
     ports:
       - "8124:8123"
       - "9001:9000"

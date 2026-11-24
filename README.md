@@ -531,8 +531,8 @@ These are two different things, and keeping them separate is what lets a
 migration bootstrap its own database:
 
 - **`--bookkeeping-database`** (default `_chum`) is chum's own — it holds the
-  bookkeeping table. chum runs `CREATE DATABASE IF NOT EXISTS` for it and
-  fully-qualifies every bookkeeping statement as
+  bookkeeping table. chum creates it if it doesn't exist (so a pre-created
+  one needs no `CREATE DATABASE` grant) and fully-qualifies every bookkeeping statement as
   `<bookkeeping-database>.<table>`, so bookkeeping **never depends on any app
   database existing**.
 - **`--database`** is the *session default* for **unqualified** object names in
@@ -608,16 +608,17 @@ fn migrations_have_no_template_mistakes() {
 
 `Migrator::check_matching` takes a predicate, e.g. to skip applied versions.
 
-The migrator takes a [`Bookkeeping`] target (database + table). It runs
-`CREATE DATABASE IF NOT EXISTS` for the bookkeeping database and fully-qualifies
-all bookkeeping SQL, so it never needs an app database to exist.
+The migrator takes a [`Bookkeeping`] target (database + table). It creates the
+bookkeeping database if it doesn't exist and fully-qualifies all bookkeeping
+SQL, so it never needs an app database to exist.
 
 ## How state is tracked
 
 `chum` records applied migrations in a bookkeeping table (default
 `_chum_migrations`) that lives in its **own dedicated database** (default
 `_chum`, override with `--bookkeeping-database`). chum creates that database
-(`CREATE DATABASE IF NOT EXISTS`) and fully-qualifies every bookkeeping
+if it doesn't exist, so a user granted only a pre-created bookkeeping database
+needs no `CREATE DATABASE` grant, and fully-qualifies every bookkeeping
 statement as `<bookkeeping-database>.<table>`. Keeping bookkeeping in its own
 database — rather than in the connection's default database — means chum never
 depends on any app database existing, so a migration is free to create its own
