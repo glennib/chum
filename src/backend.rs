@@ -193,12 +193,23 @@ struct AppliedRow {
 /// deliberately omit `IF NOT EXISTS`). It never depends on the app database, so
 /// a migration is free to create its own.
 ///
+/// ClickHouse checks the `CREATE DATABASE` grant even when `IF NOT EXISTS`
+/// would make the statement a no-op, so it is only issued when the database is
+/// missing: a user granted just a pre-created bookkeeping database can migrate.
+///
 /// # Errors
 ///
-/// Returns [`ChumError::ClickHouse`] if the DDL fails.
+/// Returns [`ChumError::ClickHouse`] if the query or the DDL fails.
 pub async fn ensure_database(client: &clickhouse::Client, bookkeeping: &Bookkeeping) -> Result<()> {
-    let ddl = format!("CREATE DATABASE IF NOT EXISTS {}", bookkeeping.database);
-    client.query(&ddl).execute().await?;
+    let existing: u64 = client
+        .query("SELECT count() FROM system.databases WHERE name = ?")
+        .bind(&bookkeeping.database)
+        .fetch_one()
+        .await?;
+    if existing == 0 {
+        let ddl = format!("CREATE DATABASE IF NOT EXISTS {}", bookkeeping.database);
+        client.query(&ddl).execute().await?;
+    }
     Ok(())
 }
 
