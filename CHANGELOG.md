@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2](https://github.com/glennib/chum/compare/v0.6.1...v0.6.2) - 2026-11-28
+
+### Other
+
+- *(deps)* update dependency cargo-binstall to v1.29.0 ([#126](https://github.com/glennib/chum/pull/126))
+- *(deps)* update rust crate sha2 to v0.11.2 ([#125](https://github.com/glennib/chum/pull/125))
+- *(deps)* update docker.io/clickhouse/clickhouse-server docker tag to v26.11 ([#124](https://github.com/glennib/chum/pull/124))
+
 ## [0.6.1](https://github.com/glennib/chum/compare/v0.6.0...v0.6.1) - 2026-11-21
 
 ### Other
